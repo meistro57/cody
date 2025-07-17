@@ -17,6 +17,8 @@ Cody is not just another chatbot - it's an **autonomous AI development assistant
 - 🧠 **Learn from your project** context and adapt
 
 Think of it as having a junior developer who never sleeps, never complains, and gets excited about automating everything.
+<img width="1110" height="873" alt="image" src="https://github.com/user-attachments/assets/cea6ba58-ed6b-4b09-ab2d-ef1314ab4817" />
+
 
 ## 🚀 Quick Start
 
