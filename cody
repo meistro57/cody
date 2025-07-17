@@ -471,11 +471,49 @@ handle_fix() {
 handle_files() {
     echo -e "${BLUE}📄 Project Files:${NC}"
     echo
-    
+
     find . -maxdepth 1 -type f -name "*.py" -o -name "*.js" -o -name "*.html" -o -name "*.css" -o -name "*.json" -o -name "*.md" | while read file; do
         local lines=$(wc -l < "$file" 2>/dev/null || echo "0")
         echo -e "  ${GREEN}$file${NC} ${GRAY}($lines lines)${NC}"
     done
+}
+
+handle_image() {
+    local tmp_img="/tmp/cody_clipboard_image.png"
+
+    if command -v xclip >/dev/null 2>&1; then
+        xclip -selection clipboard -t image/png -o > "$tmp_img" 2>/dev/null
+    elif command -v wl-paste >/dev/null 2>&1; then
+        wl-paste --type image/png > "$tmp_img" 2>/dev/null
+    elif command -v pngpaste >/dev/null 2>&1; then
+        pngpaste "$tmp_img" 2>/dev/null
+    else
+        echo -e "${RED}No clipboard utility found (xclip, wl-paste or pngpaste)${NC}"
+        return 1
+    fi
+
+    if [ ! -s "$tmp_img" ]; then
+        echo -e "${RED}No image data in clipboard${NC}"
+        rm -f "$tmp_img"
+        return 1
+    fi
+
+    local b64_img=$(base64 -w 0 "$tmp_img")
+    rm -f "$tmp_img"
+
+    show_typing "Analyzing image"
+    local prompt="Describe this image:\n[data:image/png;base64,$b64_img]"
+    local response=$(call_gemma "$prompt" "" "0.5")
+
+    if [ -n "$response" ]; then
+        echo -e "${BLUE}${ROBOT} Cody:${NC}"
+        echo
+        echo "$response" | sed 's/^/  /'
+        echo
+        save_to_memory "[Image pasted]" "$response"
+    else
+        echo -e "${RED}${CROSS} Failed to analyze image${NC}"
+    fi
 }
 
 handle_chat() {
