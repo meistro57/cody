@@ -32,4 +32,4 @@ Cody is a command-line assistant that connects to a local LLM service and helps 
 Conversation history is stored in `~/.cody_global_memory` and your command history in `~/.cody_history`.
 
 ## License
-MIT
+
