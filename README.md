@@ -24,7 +24,7 @@ Cody is a command-line assistant that connects to a local LLM service and helps 
 - `/run <file>` – execute a script (supports `.py`, `.js`, `.sh`)
 - `/explain <file>` – get an explanation of a code file
 - `/fix <file> <issue>` – attempt to fix the specified issue in the file
-- `/files` – list project files in the current directory
+- `/files` – list project files in the directory where Cody was launched
 - `/model` – choose another available model
 - `/image` – paste an image from the clipboard to include in a prompt
 - `/clear` – clear the conversation memory
