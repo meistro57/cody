@@ -221,7 +221,7 @@ print_header() {
     
     # Get terminal width
     local term_width=$(tput cols 2>/dev/null || echo 80)
-    local content_width=$((term_width > 80 ? 80 : term_width - 4))
+    local content_width=$term_width
     
     # Create top border
     local top_border="╭"
