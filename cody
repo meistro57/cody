@@ -238,8 +238,8 @@ print_header() {
     bottom_border+="╯"
     
     # Calculate padding for centered text
-    local title="🤖 Cody Enhanced"
-    local subtitle="AI Development Assistant"
+    local title="🤖 Cody"
+    local subtitle="AI Development Assistant by Mark Hubrich"
     local title_padding=$(( (content_width - ${#title} - 2) / 2 ))
     local subtitle_padding=$(( (content_width - ${#subtitle} - 2) / 2 ))
     
