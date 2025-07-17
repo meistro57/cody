@@ -4,7 +4,7 @@
 # Usage: ./cody
 
 # Configuration
-GEMMA_ENDPOINT="http://127.0.0.1:1234"
+GEMMA_ENDPOINT="http://192.168.1.45:1234"
 OLLAMA_ENDPOINT="http://127.0.0.1:11434"
 MODEL_NAME="mistralai/codestral-22b-v0.1"
 MEMORY_FILE="$HOME/.cody_global_memory"
