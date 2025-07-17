@@ -9,6 +9,8 @@ OLLAMA_ENDPOINT="http://127.0.0.1:11434"
 MODEL_NAME="mistralai/codestral-22b-v0.1"
 MEMORY_FILE="$HOME/.cody_global_memory"
 HISTORY_FILE="$HOME/.cody_history"
+# Directory where Cody was launched
+WORK_DIR="$(pwd)"
 
 # Colors
 RED='\033[0;31m'
@@ -302,7 +304,8 @@ show_typing() {
 get_project_context() {
     local context="Current project:\n"
     local file_count=0
-    
+
+    (cd "$WORK_DIR" || return
     for file in *.py *.js *.html *.css *.json *.md; do
         if [ -f "$file" ]; then
             local lines=$(wc -l < "$file" 2>/dev/null || echo "0")
@@ -310,9 +313,9 @@ get_project_context() {
             ((file_count++))
         fi
     done
-    
-    context="$context\nDirectory: $PWD\nFiles: $file_count\n"
-    echo -e "$context"
+
+    context="$context\nDirectory: $WORK_DIR\nFiles: $file_count\n"
+    echo -e "$context")
 }
 
 # Call AI API
@@ -389,8 +392,8 @@ handle_create() {
             code="$response"
         fi
         
-        echo "$code" > "$filename"
-        local lines=$(wc -l < "$filename")
+        echo "$code" > "$WORK_DIR/$filename"
+        local lines=$(wc -l < "$WORK_DIR/$filename")
         echo -e "${GREEN}${CHECKMARK} Created $filename ($lines lines)${NC}"
         save_to_memory "create $filename: $description" "Created $filename"
     else
@@ -406,17 +409,19 @@ handle_edit() {
         return 1
     fi
     
-    if [ ! -f "$filename" ]; then
+    local target="$WORK_DIR/$filename"
+
+    if [ ! -f "$target" ]; then
         echo -e "${RED}${CROSS} File not found: $filename${NC}"
         return 1
     fi
-    
+
     echo -e "${BLUE}Opening $filename...${NC}"
-    
+
     if command -v nano > /dev/null; then
-        nano "$filename"
+        nano "$target"
     elif command -v vim > /dev/null; then
-        vim "$filename"
+        vim "$target"
     else
         echo -e "${RED}No editor found${NC}"
         return 1
@@ -427,13 +432,14 @@ handle_edit() {
 
 handle_run() {
     local filename="$1"
+    local target="$WORK_DIR/$filename"
     
     if [ -z "$filename" ]; then
         echo -e "${RED}Usage: /run <filename>${NC}"
         return 1
     fi
     
-    if [ ! -f "$filename" ]; then
+    if [ ! -f "$target" ]; then
         echo -e "${RED}${CROSS} File not found: $filename${NC}"
         return 1
     fi
@@ -442,9 +448,9 @@ handle_run() {
     echo -e "${GRAY}────────────────────────────────────────${NC}"
     
     case "$filename" in
-        *.py) python "$filename" ;;
-        *.js) node "$filename" ;;
-        *.sh) bash "$filename" ;;
+        *.py) python "$target" ;;
+        *.js) node "$target" ;;
+        *.sh) bash "$target" ;;
         *) echo -e "${YELLOW}Don't know how to run $filename${NC}" ;;
     esac
     
@@ -454,20 +460,21 @@ handle_run() {
 
 handle_explain() {
     local filename="$1"
-    
+    local target="$WORK_DIR/$filename"
+
     if [ -z "$filename" ]; then
         echo -e "${RED}Usage: /explain <filename>${NC}"
         return 1
     fi
-    
-    if [ ! -f "$filename" ]; then
+
+    if [ ! -f "$target" ]; then
         echo -e "${RED}${CROSS} File not found: $filename${NC}"
         return 1
     fi
-    
+
     show_typing "Analyzing $filename"
-    
-    local code=$(cat "$filename")
+
+    local code=$(cat "$target")
     local prompt="Explain this code in detail:\n\n$code"
     
     local response=$(call_gemma "$prompt" "" "0.5")
@@ -486,20 +493,21 @@ handle_explain() {
 handle_fix() {
     local filename="$1"
     local issue="$2"
+    local target="$WORK_DIR/$filename"
     
     if [ -z "$filename" ] || [ -z "$issue" ]; then
         echo -e "${RED}Usage: /fix <filename> <issue>${NC}"
         return 1
     fi
     
-    if [ ! -f "$filename" ]; then
+    if [ ! -f "$target" ]; then
         echo -e "${RED}${CROSS} File not found: $filename${NC}"
         return 1
     fi
     
     show_typing "Fixing $filename"
     
-    local code=$(cat "$filename")
+    local code=$(cat "$target")
     local prompt="Fix this code to resolve: $issue\n\nCode:\n$code\n\nProvide the complete fixed code:"
     
     local response=$(call_gemma "$prompt" "You are a code debugger. Provide complete, working code fixes. Only output the fixed code." "0.3")
@@ -510,9 +518,9 @@ handle_fix() {
             fixed_code="$response"
         fi
         
-        cp "$filename" "$filename.backup"
-        echo "$fixed_code" > "$filename"
-        
+        cp "$target" "$target.backup"
+        echo "$fixed_code" > "$target"
+
         echo -e "${GREEN}${CHECKMARK} Fixed $filename (backup: $filename.backup)${NC}"
         save_to_memory "fix $filename: $issue" "Fixed $filename"
     else
@@ -524,10 +532,13 @@ handle_files() {
     echo -e "${BLUE}📄 Project Files:${NC}"
     echo
 
-    find . -maxdepth 1 -type f -name "*.py" -o -name "*.js" -o -name "*.html" -o -name "*.css" -o -name "*.json" -o -name "*.md" | while read file; do
-        local lines=$(wc -l < "$file" 2>/dev/null || echo "0")
-        echo -e "  ${GREEN}$file${NC} ${GRAY}($lines lines)${NC}"
-    done
+    (
+        cd "$WORK_DIR" || return
+        find . -maxdepth 1 -type f \( -name "*.py" -o -name "*.js" -o -name "*.html" -o -name "*.css" -o -name "*.json" -o -name "*.md" \) | while read -r file; do
+            local lines=$(wc -l < "$file" 2>/dev/null || echo "0")
+            echo -e "  ${GREEN}${file#./}${NC} ${GRAY}($lines lines)${NC}"
+        done
+    )
 }
 
 handle_image() {
