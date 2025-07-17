@@ -5,6 +5,7 @@
 
 # Configuration
 GEMMA_ENDPOINT="http://127.0.0.1:1234"
+OLLAMA_ENDPOINT="http://127.0.0.1:11434"
 MODEL_NAME="mistralai/codestral-22b-v0.1"
 MEMORY_FILE="$HOME/.cody_global_memory"
 HISTORY_FILE="$HOME/.cody_history"
@@ -41,6 +42,40 @@ fetch_available_models() {
         # Extract all `id` fields to handle different response shapes
         mapfile -t AVAILABLE_MODELS < <(echo "$resp" | jq -r '..|.id? // empty')
     fi
+}
+
+# Check if an Ollama server is reachable
+detect_ollama() {
+    curl -s "$OLLAMA_ENDPOINT/v1/models" >/dev/null 2>&1
+}
+
+# Allow the user to choose between LM Studio and Ollama if both are available
+select_endpoint() {
+    local endpoints=("$GEMMA_ENDPOINT")
+    local names=("LM Studio ($GEMMA_ENDPOINT)")
+
+    if detect_ollama; then
+        endpoints+=("$OLLAMA_ENDPOINT")
+        names+=("Ollama ($OLLAMA_ENDPOINT)")
+    fi
+
+    if [ ${#endpoints[@]} -gt 1 ]; then
+        echo -e "${BLUE}Available servers:${NC}"
+        local i=1
+        for name in "${names[@]}"; do
+            echo -e "  ${YELLOW}${i}.${NC} $name"
+            ((i++))
+        done
+        echo
+
+        local choice
+        read -e -p "$(echo -e "${GREEN}Select server (1-${#endpoints[@]}) or Enter for default [1]: ${NC}")" choice
+        if [[ $choice =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#endpoints[@]} ]; then
+            GEMMA_ENDPOINT="${endpoints[$((choice-1))]}"
+        fi
+    fi
+
+    echo -e "${GREEN}✓ Using endpoint: $GEMMA_ENDPOINT${NC}"
 }
 
 # Setup enhanced readline with terminal resize handling
@@ -621,6 +656,9 @@ fi
 
 # Load saved model if available
 load_model_preference
+
+# Offer to select the endpoint (LM Studio or Ollama)
+select_endpoint
 
 # Test connection
 echo -e "${BLUE}Testing connection...${NC}"

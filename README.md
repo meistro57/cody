@@ -9,7 +9,9 @@ Cody is a command-line assistant that connects to a local LLM service and helps 
 
 ## Getting Started
 1. Install the required dependencies.
-2. Start your local inference server and update `GEMMA_ENDPOINT` in `./cody` if needed.
+2. Start your local inference server. The script will detect Ollama running on
+   `localhost:11434` and prompt you to choose between it and the LM Studio
+   endpoint defined by `GEMMA_ENDPOINT`.
 3. Run the script:
    ```bash
    ./cody
