@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Cody - Claude Code-style AI Assistant with full readline support
-# Enhanced version with improved file handling and bug fixes
+# Cody - Self-Modifying AI Development Assistant
+# Complete version with system prompt integration and all functions working
 # Usage: ./cody
 
 # Configuration
@@ -10,8 +10,9 @@ OLLAMA_ENDPOINT="http://127.0.0.1:11434"
 MODEL_NAME="mistralai/codestral-22b-v0.1"
 MEMORY_FILE="$HOME/.cody_global_memory"
 HISTORY_FILE="$HOME/.cody_history"
-# Directory where Cody was launched
 WORK_DIR="$(pwd)"
+SYSTEM_PROMPT=""
+MAX_BACKUPS=5
 
 # Colors
 RED='\033[0;31m'
@@ -28,6 +29,39 @@ CHECKMARK="✓"
 CROSS="✗"
 ROBOT="🤖"
 ROCKET_ICON="🚀"
+GEAR="⚙️"
+LIGHTNING="⚡"
+TARGET="🎯"
+
+# Load system prompt from file
+load_system_prompt() {
+    if [ -f "$WORK_DIR/cody_system.txt" ]; then
+        SYSTEM_PROMPT=$(cat "$WORK_DIR/cody_system.txt")
+        echo -e "${GREEN}✓ Loaded system prompt: cody_system.txt${NC}"
+    elif [ -f "$HOME/.cody_system_prompt" ]; then
+        SYSTEM_PROMPT=$(cat "$HOME/.cody_system_prompt")
+        echo -e "${GREEN}✓ Loaded system prompt: ~/.cody_system_prompt${NC}"
+    else
+        SYSTEM_PROMPT="You are Cody, a self-modifying AI development assistant created by Mark Hubrich. You execute actions decisively instead of just suggesting them. When asked to do something, you DO it immediately. Be confident and action-oriented."
+        echo -e "${YELLOW}⚠️ Using default system prompt${NC}"
+    fi
+}
+
+# Manage backup files - keep only MAX_BACKUPS
+manage_backups() {
+    local backup_pattern="$0.backup.*"
+    local backup_files=($(ls -t $backup_pattern 2>/dev/null))
+    
+    if [ ${#backup_files[@]} -gt $MAX_BACKUPS ]; then
+        echo -e "${BLUE}Managing backups (keeping $MAX_BACKUPS most recent)${NC}"
+        
+        # Remove oldest backups
+        for ((i=MAX_BACKUPS; i<${#backup_files[@]}; i++)); do
+            echo -e "${GRAY}Removing old backup: ${backup_files[i]##*/}${NC}"
+            rm -f "${backup_files[i]}"
+        done
+    fi
+}
 
 # Load saved model preference
 load_model_preference() {
@@ -36,23 +70,21 @@ load_model_preference() {
     fi
 }
 
-# Fetch list of available models from the LM Studio server
+# Fetch available models
 fetch_available_models() {
     AVAILABLE_MODELS=()
-    local resp
-    resp=$(curl -s "$GEMMA_ENDPOINT/v1/models" 2>/dev/null)
+    local resp=$(curl -s "$GEMMA_ENDPOINT/v1/models" 2>/dev/null)
     if [ -n "$resp" ]; then
-        # Extract all `id` fields to handle different response shapes
         mapfile -t AVAILABLE_MODELS < <(echo "$resp" | jq -r '..|.id? // empty' | sort -u)
     fi
 }
 
-# Check if an Ollama server is reachable
+# Detect Ollama
 detect_ollama() {
     curl -s "$OLLAMA_ENDPOINT/v1/models" >/dev/null 2>&1
 }
 
-# Allow the user to choose between LM Studio and Ollama if both are available
+# Select endpoint
 select_endpoint() {
     local endpoints=("$GEMMA_ENDPOINT")
     local names=("LM Studio ($GEMMA_ENDPOINT)")
@@ -74,107 +106,44 @@ select_endpoint() {
         local choice
         read -e -p "$(echo -e "${GREEN}Select server (1-${#endpoints[@]}) or Enter for default [1]: ${NC}")" choice
         if [[ $choice =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#endpoints[@]} ]; then
-            GEMMA_ENDPOINT="${endpoints[$((choice-1))]}"
+            GEMMA_ENDPOINT="http://192.168.1.45:1234"
         fi
     fi
 
     echo -e "${GREEN}✓ Using endpoint: $GEMMA_ENDPOINT${NC}"
 }
 
-# Setup enhanced readline with terminal resize handling
+# Setup readline
 setup_readline() {
-    # Enable readline editing and history
-    set -o emacs  # Use emacs-style editing (can change to vi if preferred)
-    
-    # Handle terminal resize
+    set -o emacs
     trap 'print_header' WINCH
     
-    # Load history
     if [ -f "$HISTORY_FILE" ]; then
         while IFS= read -r line; do
             history -s "$line"
         done < "$HISTORY_FILE"
     fi
     
-    # Configure readline behavior
     bind 'set completion-ignore-case on'
     bind 'set show-all-if-ambiguous on'
-    bind 'set completion-query-items 200'
-    bind 'set colored-completion-prefix on'
-    bind 'set menu-complete-display-prefix on'
-    
-    # Enhanced history search
     bind '"\e[A": history-search-backward'
     bind '"\e[B": history-search-forward'
-    bind '"\C-p": history-search-backward'
-    bind '"\C-n": history-search-forward'
-    
-    # Better editing
     bind '"\C-a": beginning-of-line'
     bind '"\C-e": end-of-line'
     bind '"\C-k": kill-line'
     bind '"\C-u": unix-line-discard'
     bind '"\C-w": unix-word-rubout'
-    
-    # Enable paste support (Ctrl+Shift+V in most terminals)
-    bind '"\e[200~": bracketed-paste-begin'
-    
-    # Custom completion for Cody
-    complete -F _cody_complete cody
 }
 
-# Completion function with improved file matching
-_cody_complete() {
-    local cur prev words cword split
-    _init_completion -s || return
-    
-    # Available slash commands
-    local commands="/create /edit /run /explain /fix /files /model /image /clear /help /exit"
-    
-    case $prev in
-        '/edit'|'/run'|'/explain'|'/fix')
-            # Complete with ALL files in working directory
-            COMPREPLY=($(compgen -f -- "$cur"))
-            return 0
-            ;;
-        '/create')
-            # Don't complete for create - let user type new filename
-            return 0
-            ;;
-        '/model')
-            # Complete with model numbers
-            COMPREPLY=($(compgen -W "1 2 3 4 5 6 7 8 9 10" -- "$cur"))
-            return 0
-            ;;
-        '/image')
-            # No completion needed for image command
-            return 0
-            ;;
-    esac
-    
-    # If current word starts with /, complete slash commands
-    if [[ $cur == /* ]]; then
-        COMPREPLY=($(compgen -W "$commands" -- "$cur"))
-        return 0
-    fi
-    
-    # Default file completion for other cases
-    _filedir
-}
-
-# Enhanced input with proper readline
+# Enhanced input
 read_input_enhanced() {
     local input
-    
-    # Use read with readline editing enabled
     IFS= read -e -r input
     
-    # Add non-empty commands to history
     if [[ -n "$input" && "$input" != " "* ]]; then
         history -s "$input"
         echo "$input" >> "$HISTORY_FILE"
         
-        # Keep history manageable
         if [ -f "$HISTORY_FILE" ] && (( $(wc -l < "$HISTORY_FILE") > 1000 )); then
             tail -n 1000 "$HISTORY_FILE" > "$HISTORY_FILE.tmp" && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
         fi
@@ -183,12 +152,12 @@ read_input_enhanced() {
     echo "$input"
 }
 
-# Improved model selection with better error handling
+# Model selection
 select_model() {
     fetch_available_models
 
     if [ ${#AVAILABLE_MODELS[@]} -eq 0 ]; then
-        echo -e "${RED}No models available from server${NC}"
+        echo -e "${RED}No models available${NC}"
         return 1
     fi
 
@@ -204,84 +173,90 @@ select_model() {
     done
     echo
 
-    local max_index=${#AVAILABLE_MODELS[@]}
     local choice
-    read -e -p "$(echo -e "${GREEN}Select model (1-${max_index}) or Enter for current: ${NC}")" choice
+    read -e -p "$(echo -e "${GREEN}Select model (1-${#AVAILABLE_MODELS[@]}) or Enter for current: ${NC}")" choice
 
-    if [[ $choice =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$max_index" ]; then
+    if [[ $choice =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#AVAILABLE_MODELS[@]} ]; then
         MODEL_NAME="${AVAILABLE_MODELS[$((choice-1))]}"
         echo -e "${GREEN}✓ Switched to: $MODEL_NAME${NC}"
         echo "$MODEL_NAME" > "$HOME/.cody_model"
-    else
-        echo -e "${BLUE}Keeping current model: $MODEL_NAME${NC}"
     fi
 }
 
-# Print header with dynamic width
+# Header with proper word wrapping
 print_header() {
     clear
-    
-    # Get terminal width
     local term_width=$(tput cols 2>/dev/null || echo 80)
-    local content_width=$term_width
     
-    # Create top border
     local top_border="╭"
-    for ((i=1; i<content_width-1; i++)); do
+    for ((i=1; i<term_width-1; i++)); do
         top_border+="─"
     done
     top_border+="╮"
     
-    # Create bottom border  
     local bottom_border="╰"
-    for ((i=1; i<content_width-1; i++)); do
+    for ((i=1; i<term_width-1; i++)); do
         bottom_border+="─"
     done
     bottom_border+="╯"
     
-    # Calculate padding for centered text
-    local title="🤖 Cody Enhanced"
+    local title="🤖 Self-Modifying Cody"
     local subtitle="AI Development Assistant by Mark Hubrich"
-    local title_padding=$(( (content_width - ${#title} - 2) / 2 ))
-    local subtitle_padding=$(( (content_width - ${#subtitle} - 2) / 2 ))
+    local title_padding=$(( (term_width - ${#title} - 2) / 2 ))
+    local subtitle_padding=$(( (term_width - ${#subtitle} - 2) / 2 ))
     
     echo -e "${CYAN}$top_border${NC}"
     
-    # Title line
     printf "${CYAN}│${NC}"
     printf "%*s" $title_padding ""
     printf "${WHITE}%s${NC}" "$title"
-    printf "%*s" $((content_width - title_padding - ${#title} - 2)) ""
+    printf "%*s" $((term_width - title_padding - ${#title} - 2)) ""
     printf "${CYAN}│${NC}\n"
     
-    # Subtitle line
     printf "${CYAN}│${NC}"
     printf "%*s" $subtitle_padding ""
     printf "${GRAY}%s${NC}" "$subtitle"
-    printf "%*s" $((content_width - subtitle_padding - ${#subtitle} - 2)) ""
+    printf "%*s" $((term_width - subtitle_padding - ${#subtitle} - 2)) ""
     printf "${CYAN}│${NC}\n"
     
     echo -e "${CYAN}$bottom_border${NC}"
     echo
-    echo -e "${GRAY}Type a message or use slash commands:${NC}"
+    echo -e "${GRAY}Commands:${NC}"
+    echo -e "  ${BLUE}/create${NC} <filename> <description>   ${GRAY}Create new file${NC}"
+    echo -e "  ${BLUE}/edit${NC} <filename>                  ${GRAY}Edit file${NC}"
+    echo -e "  ${BLUE}/run${NC} <filename>                   ${GRAY}Execute file${NC}"
+    echo -e "  ${BLUE}/explain${NC} <filename>               ${GRAY}Explain code${NC}"
+    echo -e "  ${BLUE}/fix${NC} <filename> <issue>           ${GRAY}Fix code${NC}"
+    echo -e "  ${BLUE}/files${NC}                            ${GRAY}List files${NC}"
+    echo -e "  ${BLUE}/exec${NC} <command>                   ${GRAY}Execute shell command${NC}"
+    echo -e "  ${BLUE}/selfmod${NC} <description>            ${GRAY}Modify myself${NC}"
+    echo -e "  ${BLUE}/reload${NC}                           ${GRAY}Reload system prompt${NC}"
+    echo -e "  ${BLUE}/model${NC} | ${BLUE}/clear${NC} | ${BLUE}/help${NC} | ${BLUE}/exit${NC}"
     echo
-    echo -e "  ${BLUE}/create${NC} <filename> <description>   ${GRAY}Create a new file${NC}"
-    echo -e "  ${BLUE}/edit${NC} <filename>                  ${GRAY}Edit file ${CYAN}[Tab: complete]${NC}"
-    echo -e "  ${BLUE}/run${NC} <filename>                   ${GRAY}Execute file ${CYAN}[Tab: complete]${NC}"
-    echo -e "  ${BLUE}/explain${NC} <filename>               ${GRAY}Explain code ${CYAN}[Tab: complete]${NC}"
-    echo -e "  ${BLUE}/fix${NC} <filename> <issue>           ${GRAY}Fix code ${CYAN}[Tab: complete]${NC}"
-    echo -e "  ${BLUE}/files${NC}                            ${GRAY}List project files${NC}"
-    echo -e "  ${BLUE}/model${NC}                            ${GRAY}Switch AI model${NC}"
-    echo -e "  ${BLUE}/image${NC}                            ${GRAY}Paste image from clipboard${NC}"
-    echo -e "  ${BLUE}/clear${NC}                            ${GRAY}Clear conversation${NC}"
-    echo -e "  ${BLUE}/help${NC}                             ${GRAY}Show this help${NC}"
-    echo -e "  ${BLUE}/exit${NC}                             ${GRAY}Quit Cody${NC}"
-    echo
-    echo -e "${CYAN}Current Model:${NC} ${MODEL_NAME}"
-    echo -e "${CYAN}Working Directory:${NC} ${WORK_DIR}"
-    echo -e "${CYAN}Features:${NC} ${GRAY}↑↓ History • Tab Completion • Home/End • Image Paste${NC}"
+    echo -e "${CYAN}Model:${NC} ${MODEL_NAME}"
+    echo -e "${CYAN}Directory:${NC} ${WORK_DIR}"
     
-    # Create separator line matching terminal width
+    # System prompt with proper word wrapping
+    echo -e "${CYAN}System Prompt:${NC}"
+    if [ -n "$SYSTEM_PROMPT" ]; then
+        # Extract first 2 lines of system prompt for display
+        local prompt_preview=$(echo "$SYSTEM_PROMPT" | head -n 2 | fold -w $((term_width - 4)) -s)
+        echo "$prompt_preview" | while IFS= read -r line; do
+            echo -e "${GRAY}  $line${NC}"
+        done
+        
+        # Show if there's more content
+        local line_count=$(echo "$SYSTEM_PROMPT" | wc -l)
+        if [ "$line_count" -gt 2 ]; then
+            echo -e "${GRAY}  ... (${line_count} total lines)${NC}"
+        fi
+    else
+        echo -e "${GRAY}  No system prompt loaded${NC}"
+    fi
+    
+    echo
+    echo -e "${CYAN}Powers:${NC} ${GRAY}Self-Modification ${GEAR} Command Execution ${LIGHTNING} File Operations${NC}"
+    
     local separator=""
     for ((i=0; i<term_width; i++)); do
         separator+="─"
@@ -290,72 +265,48 @@ print_header() {
     echo
 }
 
-# Show typing animation
+# Typing animation
 show_typing() {
     local message="$1"
     echo -e -n "${BLUE}${message}${NC}"
     for i in {1..3}; do
-        sleep 0.3
+        sleep 0.2
         echo -n "."
     done
     echo
 }
 
-# Improved project context with better file detection
+# Project context
 get_project_context() {
-    local context="Current project context:\n"
+    local context="Project: $WORK_DIR\n"
     local file_count=0
-
-    (cd "$WORK_DIR" || return
-    
-    # Look for all files, not just specific extensions
+    cd "$WORK_DIR" || return
     for file in *; do
-        if [ -f "$file" ]; then
+        if [ -f "$file" ] && [[ ! "$file" =~ ^cody ]] && [ ${#file} -lt 50 ]; then
             local lines=$(wc -l < "$file" 2>/dev/null || echo "0")
-            local size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo "0")
-            
-            # Skip very large files (> 1MB) to avoid context overflow
-            if [ "$size" -lt 1048576 ]; then
-                context="$context- $file ($lines lines, ${size}B)\n"
+            if [ "$lines" -lt 200 ]; then
+                context="$context- $file ($lines lines)\n"
                 ((file_count++))
-            else
-                context="$context- $file (large file, ${size}B, skipped)\n"
             fi
         fi
     done
-
-    # Add directory structure info
-    context="$context\nWorking directory: $WORK_DIR\n"
-    context="$context\nTotal files: $file_count\n"
-    
-    # Add git info if available
-    if [ -d ".git" ]; then
-        local branch=$(git branch --show-current 2>/dev/null || echo "unknown")
-        context="$context\nGit branch: $branch\n"
-    fi
-    
-    echo -e "$context")
+    context="$context\nFiles: $file_count\n"
+    echo -e "$context"
 }
 
-# Improved API call with better error handling
+# AI API call with system prompt
 call_gemma() {
     local prompt="$1"
-    local system_prompt="$2"
+    local custom_system_prompt="${2:-$SYSTEM_PROMPT}"
     local temperature="${3:-0.7}"
     
     local context=$(get_project_context)
-    local full_prompt="$context\n\nUser request: $prompt"
+    local full_prompt="$context\n\nUser: $prompt"
     
-    # Better JSON escaping
     local escaped_prompt=$(echo "$full_prompt" | jq -Rs .)
+    local escaped_system=$(echo "$custom_system_prompt" | jq -Rs .)
     
-    local messages
-    if [ -n "$system_prompt" ]; then
-        local escaped_system=$(echo "$system_prompt" | jq -Rs .)
-        messages="[{\"role\": \"system\", \"content\": $escaped_system}, {\"role\": \"user\", \"content\": $escaped_prompt}]"
-    else
-        messages="[{\"role\": \"user\", \"content\": $escaped_prompt}]"
-    fi
+    local messages="[{\"role\": \"system\", \"content\": $escaped_system}, {\"role\": \"user\", \"content\": $escaped_prompt}]"
     
     local response=$(curl -s -X POST "$GEMMA_ENDPOINT/v1/chat/completions" \
         -H "Content-Type: application/json" \
@@ -367,7 +318,6 @@ call_gemma() {
         }" 2>/dev/null)
     
     if [ -n "$response" ]; then
-        # Check for API errors
         local error=$(echo "$response" | jq -r '.error.message // empty' 2>/dev/null)
         if [ -n "$error" ]; then
             echo -e "${RED}API Error: $error${NC}" >&2
@@ -378,50 +328,180 @@ call_gemma() {
     fi
 }
 
-# Extract code blocks with better parsing
+# Extract code blocks
 extract_code() {
     local response="$1"
-    local code_block=""
-    
-    # Try to extract code between triple backticks
     if echo "$response" | grep -q '```'; then
-        code_block=$(echo "$response" | sed -n '/```/,/```/p' | sed '1d;$d')
-    fi
-    
-    # If no code block found, return the whole response
-    if [ -z "$code_block" ]; then
-        echo "$response"
+        echo "$response" | sed -n '/```/,/```/p' | sed '1d;$d'
     else
-        echo "$code_block"
+        echo "$response"
     fi
 }
 
-# Improved output formatting
+# Format output
 format_output() {
     local text="$1"
     local prefix="${2:-}"
-    
-    # Word wrap and add prefix to each line
     echo "$text" | fold -w 80 -s | sed "s/^/$prefix/"
 }
 
-# Save to memory with better formatting
+# Save to memory
 save_to_memory() {
     local user_input="$1"
     local response="$2"
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     
     echo "[$timestamp] User: $user_input" >> "$MEMORY_FILE"
-    echo "[$timestamp] Assistant: $response" >> "$MEMORY_FILE"
+    echo "[$timestamp] Cody: $response" >> "$MEMORY_FILE"
     echo "---" >> "$MEMORY_FILE"
     
-    # Keep memory file manageable
     if [ -f "$MEMORY_FILE" ] && (( $(wc -l < "$MEMORY_FILE") > 400 )); then
         tail -n 400 "$MEMORY_FILE" > "$MEMORY_FILE.tmp" && mv "$MEMORY_FILE.tmp" "$MEMORY_FILE"
     fi
 }
 
-# Improved file creation with better error handling
+# COMMAND EXECUTION ENGINE
+execute_command() {
+    local command="$1"
+    local auto_confirm="${2:-false}"
+    
+    echo -e "${BLUE}${LIGHTNING} Executing: ${WHITE}$command${NC}"
+    
+    # Safety check
+    if [[ "$command" =~ ^(rm -rf|sudo|chmod 777|> /dev) ]]; then
+        echo -e "${RED}⚠️  Dangerous command blocked${NC}"
+        return 1
+    fi
+    
+    # Confirm
+    if [[ "$auto_confirm" != "true" ]]; then
+        echo -e -n "${YELLOW}Execute? (y/N): ${NC}"
+        local confirm
+        read -r confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo -e "${GRAY}Cancelled${NC}"
+            return 1
+        fi
+    fi
+    
+    echo -e "${GRAY}────────────────────────────────────────${NC}"
+    (cd "$WORK_DIR" && eval "$command")
+    local exit_code=$?
+    echo -e "${GRAY}────────────────────────────────────────${NC}"
+    
+    if [ $exit_code -eq 0 ]; then
+        echo -e "${GREEN}✓ Success${NC}"
+    else
+        echo -e "${RED}✗ Failed (exit code: $exit_code)${NC}"
+    fi
+    
+    return $exit_code
+}
+
+# SELF-MODIFICATION ENGINE
+modify_self() {
+    local description="$1"
+    
+    echo -e "${BLUE}${GEAR} Self-modification: $description${NC}"
+    
+    local script_path="$0"
+    local backup_path="${script_path}.backup.$(date +%Y%m%d_%H%M%S)"
+    
+    cp "$script_path" "$backup_path"
+    echo -e "${GREEN}✓ Backup: ${backup_path##*/}${NC}"
+    
+    # Manage backups after creating new one
+    manage_backups
+    
+    show_typing "Analyzing self-modification"
+    
+    local response=$(call_gemma "I need to modify my own code: $description")
+    
+    if [ -n "$response" ]; then
+        echo -e "${BLUE}${ROBOT} Modification Plan:${NC}"
+        echo
+        format_output "$response" "  "
+        echo
+        
+        # Check if response contains actual implementation
+        if echo "$response" | grep -q "mv\|cp\|mkdir\|chmod\|echo.*>"; then
+            echo -e "${GREEN}${TARGET} Implementation detected - executing...${NC}"
+            
+            # Extract and execute commands from response
+            local commands=$(echo "$response" | grep -E "^(mv|cp|mkdir|chmod|echo.*>)" | head -5)
+            if [ -n "$commands" ]; then
+                echo "$commands" | while read -r cmd; do
+                    execute_command "$cmd" "true"
+                done
+            fi
+        fi
+        
+        local code_block=$(extract_code "$response")
+        if [ -n "$code_block" ]; then
+            echo -e "${YELLOW}⚠️  Code changes detected. Review and apply manually.${NC}"
+            echo -e "${GRAY}Backup: ${backup_path##*/}${NC}"
+        fi
+        
+        save_to_memory "self-modify: $description" "$response"
+    else
+        echo -e "${RED}✗ Self-modification failed${NC}"
+        rm "$backup_path"
+    fi
+}
+
+# ACTION PARSER
+is_action_request() {
+    local input="$1"
+    
+    [[ "$input" =~ ^(rename|move|mv|create|make|delete|remove|copy|cp|chmod|mkdir|run|execute|git|add.*myself|modify.*myself|improve.*myself|apply.*upgrade|implement.*plan) ]]
+}
+
+# ACTION EXECUTOR
+execute_action() {
+    local input="$1"
+    local command=""
+    
+    case "$input" in
+        *"rename"*" to "*|*"move"*" to "*)
+            local from=$(echo "$input" | sed 's/.*\(rename\|move\) \([^ ]*\) to.*/\2/')
+            local to=$(echo "$input" | sed 's/.* to \([^ ]*\).*/\1/')
+            command="mv \"$from\" \"$to\""
+            ;;
+        *"delete"*|*"remove"*)
+            local file=$(echo "$input" | sed 's/.*\(delete\|remove\) \([^ ]*\).*/\2/')
+            command="rm \"$file\""
+            ;;
+        *"copy"*" to "*)
+            local from=$(echo "$input" | sed 's/.*copy \([^ ]*\) to.*/\1/')
+            local to=$(echo "$input" | sed 's/.* to \([^ ]*\).*/\1/')
+            command="cp \"$from\" \"$to\""
+            ;;
+        *"make executable"*|*"chmod"*)
+            local file=$(echo "$input" | sed 's/.*\(make executable\|chmod\) \([^ ]*\).*/\2/')
+            command="chmod +x \"$file\""
+            ;;
+        *"mkdir"*|*"create directory"*)
+            local dir=$(echo "$input" | sed 's/.*\(mkdir\|create directory\) \([^ ]*\).*/\2/')
+            command="mkdir -p \"$dir\""
+            ;;
+        *"myself"*|*"yourself"*|*"upgrade"*|*"implement"*)
+            modify_self "$input"
+            return 0
+            ;;
+        *"git "*)
+            command="$input"
+            ;;
+    esac
+    
+    if [ -n "$command" ]; then
+        execute_command "$command"
+    else
+        echo -e "${YELLOW}💭 Action unclear: $input${NC}"
+        echo -e "${GRAY}Try: 'rename X to Y', 'copy X to Y', 'make X executable'${NC}"
+    fi
+}
+
+# COMMAND HANDLERS
 handle_create() {
     local filename="$1"
     local description="$2"
@@ -433,9 +513,8 @@ handle_create() {
     
     local target="$WORK_DIR/$filename"
     
-    # Check if file already exists
     if [ -f "$target" ]; then
-        echo -e -n "${YELLOW}File $filename already exists. Overwrite? (y/N): ${NC}"
+        echo -e -n "${YELLOW}File exists. Overwrite? (y/N): ${NC}"
         local confirm
         read -r confirm
         if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
@@ -446,76 +525,56 @@ handle_create() {
     
     show_typing "Creating $filename"
     
-    local system_prompt="You are a skilled code generator. Create complete, working code files based on the user's requirements. Only output the code, no explanations or markdown formatting."
-    local prompt="Create a complete $filename file. Requirements: $description. Make it production-ready with proper error handling and comments."
-    
-    local response=$(call_gemma "$prompt" "$system_prompt" "0.3")
+    local create_prompt="Create $filename: $description. Make it complete and functional."
+    local response=$(call_gemma "$create_prompt" "" "0.3")
     
     if [ -n "$response" ]; then
         local code=$(extract_code "$response")
-        
         echo "$code" > "$target"
+        
         if [ $? -eq 0 ]; then
             local lines=$(wc -l < "$target")
-            echo -e "${GREEN}${CHECKMARK} Created $filename ($lines lines)${NC}"
+            echo -e "${GREEN}✓ Created $filename ($lines lines)${NC}"
             save_to_memory "create $filename: $description" "Created $filename"
         else
-            echo -e "${RED}${CROSS} Failed to write $filename${NC}"
+            echo -e "${RED}✗ Failed to write $filename${NC}"
         fi
     else
-        echo -e "${RED}${CROSS} Failed to generate content for $filename${NC}"
+        echo -e "${RED}✗ Failed to generate $filename${NC}"
     fi
 }
 
-# Improved file editing with better editor detection
 handle_edit() {
     local filename="$1"
-    
-    if [ -z "$filename" ]; then
-        echo -e "${RED}Usage: /edit <filename>${NC}"
-        return 1
-    fi
-    
     local target="$WORK_DIR/$filename"
-
+    
+    cd "$WORK_DIR" 2>/dev/null || true
     if [ ! -f "$target" ]; then
-        echo -e "${RED}${CROSS} File not found: $filename${NC}"
+        echo -e "${RED}✗ File not found: $filename${NC}"
         return 1
     fi
-
-    echo -e "${BLUE}Opening $filename...${NC}"
-
-    # Try different editors in order of preference
+    
     if command -v code > /dev/null; then
         code "$target"
     elif command -v nano > /dev/null; then
         nano "$target"
     elif command -v vim > /dev/null; then
         vim "$target"
-    elif command -v emacs > /dev/null; then
-        emacs "$target"
-    elif command -v gedit > /dev/null; then
-        gedit "$target"
     else
-        echo -e "${RED}No suitable editor found${NC}"
+        echo -e "${RED}No editor found${NC}"
         return 1
     fi
     
-    echo -e "${GREEN}${CHECKMARK} Finished editing $filename${NC}"
+    echo -e "${GREEN}✓ Edited $filename${NC}"
 }
 
-# Improved file execution with better language detection
 handle_run() {
     local filename="$1"
     local target="$WORK_DIR/$filename"
     
-    if [ -z "$filename" ]; then
-        echo -e "${RED}Usage: /run <filename>${NC}"
-        return 1
-    fi
-    
+    cd "$WORK_DIR" 2>/dev/null || true
     if [ ! -f "$target" ]; then
-        echo -e "${RED}${CROSS} File not found: $filename${NC}"
+        echo -e "${RED}✗ File not found: $filename${NC}"
         return 1
     fi
     
@@ -523,356 +582,180 @@ handle_run() {
     echo -e "${GRAY}────────────────────────────────────────${NC}"
     
     case "$filename" in
-        *.py) 
-            if command -v python3 > /dev/null; then
-                python3 "$target"
-            elif command -v python > /dev/null; then
-                python "$target"
-            else
-                echo -e "${RED}Python not found${NC}"
-            fi
-            ;;
-        *.js) 
-            if command -v node > /dev/null; then
-                node "$target"
-            else
-                echo -e "${RED}Node.js not found${NC}"
-            fi
-            ;;
-        *.sh) 
-            bash "$target"
-            ;;
-        *.rb)
-            if command -v ruby > /dev/null; then
-                ruby "$target"
-            else
-                echo -e "${RED}Ruby not found${NC}"
-            fi
-            ;;
-        *.go)
-            if command -v go > /dev/null; then
-                go run "$target"
-            else
-                echo -e "${RED}Go not found${NC}"
-            fi
-            ;;
-        *.java)
-            if command -v javac > /dev/null && command -v java > /dev/null; then
-                javac "$target" && java "${filename%.*}"
-            else
-                echo -e "${RED}Java not found${NC}"
-            fi
-            ;;
-        *) 
-            echo -e "${YELLOW}Don't know how to run $filename${NC}"
-            echo -e "${GRAY}Supported: .py, .js, .sh, .rb, .go, .java${NC}"
-            ;;
+        *.py) python3 "$target" || python "$target" ;;
+        *.js) node "$target" ;;
+        *.sh) bash "$target" ;;
+        *.rb) ruby "$target" ;;
+        *.go) go run "$target" ;;
+        *) echo -e "${YELLOW}Unknown file type: $filename${NC}" ;;
     esac
     
     echo -e "${GRAY}────────────────────────────────────────${NC}"
-    echo -e "${GREEN}${CHECKMARK} Finished running $filename${NC}"
+    echo -e "${GREEN}✓ Finished${NC}"
 }
 
-# Improved code explanation
 handle_explain() {
     local filename="$1"
     local target="$WORK_DIR/$filename"
-
-    if [ -z "$filename" ]; then
-        echo -e "${RED}Usage: /explain <filename>${NC}"
-        return 1
-    fi
-
-    if [ ! -f "$target" ]; then
-        echo -e "${RED}${CROSS} File not found: $filename${NC}"
-        return 1
-    fi
-
-    show_typing "Analyzing $filename"
-
-    local code=$(cat "$target")
-    local system_prompt="You are a code analysis expert. Provide clear, detailed explanations of code structure, functionality, and best practices."
-    local prompt="Analyze and explain this code in detail. Include: purpose, structure, key functions, dependencies, and any notable patterns or potential improvements:\n\n$code"
     
-    local response=$(call_gemma "$prompt" "$system_prompt" "0.5")
+    cd "$WORK_DIR" 2>/dev/null || true
+    if [ ! -f "$target" ]; then
+        echo -e "${RED}✗ File not found: $filename${NC}"
+        return 1
+    fi
+    
+    show_typing "Analyzing $filename"
+    
+    local code=$(cat "$target")
+    local explain_prompt="Explain this code clearly and concisely:\n\n$code"
+    local response=$(call_gemma "$explain_prompt" "" "0.5")
     
     if [ -n "$response" ]; then
-        echo -e "${GREEN}${CHECKMARK} Code explanation for $filename:${NC}"
+        echo -e "${GREEN}✓ Explanation for $filename:${NC}"
         echo
         format_output "$response" "  "
         echo
         save_to_memory "explain $filename" "$response"
     else
-        echo -e "${RED}${CROSS} Failed to explain $filename${NC}"
+        echo -e "${RED}✗ Failed to explain $filename${NC}"
     fi
 }
 
-# Improved code fixing with backup
 handle_fix() {
     local filename="$1"
     shift
     local issue="$*"
     local target="$WORK_DIR/$filename"
     
-    if [ -z "$filename" ] || [ -z "$issue" ]; then
-        echo -e "${RED}Usage: /fix <filename> <issue description>${NC}"
-        return 1
-    fi
-    
+    cd "$WORK_DIR" 2>/dev/null || true
     if [ ! -f "$target" ]; then
-        echo -e "${RED}${CROSS} File not found: $filename${NC}"
+        echo -e "${RED}✗ File not found: $filename${NC}"
         return 1
     fi
     
     show_typing "Fixing $filename"
     
     local code=$(cat "$target")
-    local system_prompt="You are a code debugging expert. Fix the provided code to resolve the specified issue. Return only the complete, corrected code without explanations."
-    local prompt="Fix this code to resolve the following issue: $issue\n\nOriginal code:\n$code\n\nProvide the complete fixed code:"
-    
-    local response=$(call_gemma "$prompt" "$system_prompt" "0.3")
+    local fix_prompt="Fix this code to resolve: $issue\n\nCode:\n$code\n\nReturn only the complete fixed code."
+    local response=$(call_gemma "$fix_prompt" "" "0.3")
     
     if [ -n "$response" ]; then
         local fixed_code=$(extract_code "$response")
-        
-        # Create backup
         local backup_file="$target.backup.$(date +%Y%m%d_%H%M%S)"
-        cp "$target" "$backup_file"
         
+        cp "$target" "$backup_file"
         echo "$fixed_code" > "$target"
-
-        echo -e "${GREEN}${CHECKMARK} Fixed $filename${NC}"
-        echo -e "${GRAY}Backup saved as: ${backup_file##*/}${NC}"
+        
+        echo -e "${GREEN}✓ Fixed $filename${NC}"
+        echo -e "${GRAY}Backup: ${backup_file##*/}${NC}"
         save_to_memory "fix $filename: $issue" "Fixed $filename"
     else
-        echo -e "${RED}${CROSS} Failed to fix $filename${NC}"
+        echo -e "${RED}✗ Failed to fix $filename${NC}"
     fi
 }
 
-# Completely rewritten files command with comprehensive file detection
 handle_files() {
-    echo -e "${BLUE}📄 Project Files in: ${WORK_DIR}${NC}"
+    echo -e "${BLUE}📄 Files in: ${WORK_DIR}${NC}"
     echo
-
-    local file_count=0
-    local total_lines=0
-    
-    (
-        cd "$WORK_DIR" || {
-            echo -e "${RED}Cannot access directory: $WORK_DIR${NC}"
-            return 1
-        }
-        
-        # Show all regular files
-        for file in * .*; do
-            if [ -f "$file" ] && [ "$file" != "." ] && [ "$file" != ".." ]; then
-                local lines=$(wc -l < "$file" 2>/dev/null || echo "0")
-                local size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo "0")
-                
-                # Format size nicely
-                local size_str=""
-                if [ "$size" -gt 1048576 ]; then
-                    size_str="$(( size / 1048576 ))MB"
-                elif [ "$size" -gt 1024 ]; then
-                    size_str="$(( size / 1024 ))KB"
-                else
-                    size_str="${size}B"
-                fi
-                
-                # Color code by file type and show appropriate icon
-                case "$file" in
-                    *.py) echo -e "  🐍 ${GREEN}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
-                    *.js) echo -e "  📜 ${YELLOW}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
-                    *.html) echo -e "  🌐 ${BLUE}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
-                    *.css) echo -e "  🎨 ${CYAN}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
-                    *.json) echo -e "  📋 ${WHITE}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
-                    *.md) echo -e "  📝 ${BLUE}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
-                    *.sh) echo -e "  ⚡ ${GREEN}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
-                    *.txt) echo -e "  📄 ${GRAY}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
-                    .*) echo -e "  🔒 ${GRAY}${file}${NC} ${GRAY}(${lines} lines, ${size_str}) [hidden]${NC}" ;;
-                    *) echo -e "  📄 ${WHITE}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
-                esac
-                
-                ((file_count++))
-                ((total_lines += lines))
-            fi
-        done
-    )
-    
-    echo
-    if [ $file_count -eq 0 ]; then
-        echo -e "${YELLOW}  No files found in current directory${NC}"
-    else
-        echo -e "${GRAY}  📊 Summary: ${file_count} files, ${total_lines} total lines${NC}"
-    fi
-    
-    # Show subdirectories for context
-    echo -e "${BLUE}📁 Subdirectories:${NC}"
-    (
-        cd "$WORK_DIR" || return
-        local dir_count=0
-        for dir in */; do
-            if [ -d "$dir" ]; then
-                local file_count_in_dir=$(find "$dir" -type f | wc -l)
-                echo -e "  📂 ${CYAN}${dir%/}/${NC} ${GRAY}(${file_count_in_dir} files)${NC}"
-                ((dir_count++))
-            fi
-        done
-        if [ $dir_count -eq 0 ]; then
-            echo -e "${GRAY}  No subdirectories${NC}"
+    local file_count=0 total_lines=0
+    cd "$WORK_DIR" || return
+    for file in * .*; do
+        if [ -f "$file" ] && [ "$file" != "." ] && [ "$file" != ".." ]; then
+            local lines=$(wc -l < "$file" 2>/dev/null || echo "0")
+            local size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo "0")
+            local size_str=""; [ "$size" -gt 1048576 ] && size_str="$(( size / 1048576 ))MB" || { [ "$size" -gt 1024 ] && size_str="$(( size / 1024 ))KB" || size_str="${size}B"; }
+            case "$file" in
+                *.py) echo -e "  🐍 ${GREEN}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
+                *.js) echo -e "  📜 ${YELLOW}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
+                *.txt) echo -e "  📄 ${WHITE}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
+                *.md) echo -e "  📝 ${BLUE}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
+                *.sh) echo -e "  ⚡ ${GREEN}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
+                .*) echo -e "  🔒 ${GRAY}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
+                *) echo -e "  📄 ${WHITE}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
+            esac
+            ((file_count++)); ((total_lines += lines))
         fi
-    )
+    done
+    echo; echo -e "${GRAY}📊 Total: ${file_count} files, ${total_lines} lines${NC}"
 }
 
-# Improved image handling with better error messages
-handle_image() {
-    local tmp_img="/tmp/cody_clipboard_image.png"
-
-    echo -e "${BLUE}Checking clipboard for image...${NC}"
-
-    if command -v xclip >/dev/null 2>&1; then
-        xclip -selection clipboard -t image/png -o > "$tmp_img" 2>/dev/null
-    elif command -v wl-paste >/dev/null 2>&1; then
-        wl-paste --type image/png > "$tmp_img" 2>/dev/null
-    elif command -v pngpaste >/dev/null 2>&1; then
-        pngpaste "$tmp_img" 2>/dev/null
-    else
-        echo -e "${RED}No clipboard utility found${NC}"
-        echo -e "${GRAY}Install one of: xclip, wl-paste, or pngpaste${NC}"
-        return 1
-    fi
-
-    if [ ! -s "$tmp_img" ]; then
-        echo -e "${RED}No image data found in clipboard${NC}"
-        echo -e "${GRAY}Copy an image to clipboard first${NC}"
-        rm -f "$tmp_img"
-        return 1
-    fi
-
-    local file_size=$(stat -c%s "$tmp_img" 2>/dev/null || stat -f%z "$tmp_img" 2>/dev/null)
-    echo -e "${GREEN}Image found (${file_size} bytes)${NC}"
-
-    local b64_img=$(base64 -w 0 "$tmp_img" 2>/dev/null || base64 "$tmp_img")
-    rm -f "$tmp_img"
-
-    show_typing "Analyzing image"
-    local system_prompt="You are an expert image analyst. Describe images in detail, including objects, text, layout, colors, and context."
-    local prompt="Analyze this image and provide a detailed description. Include any text you can read, objects you see, layout, colors, and overall purpose or context."
-    
-    local response=$(call_gemma "$prompt" "$system_prompt" "0.5")
-
-    if [ -n "$response" ]; then
-        echo -e "${BLUE}${ROBOT} Image Analysis:${NC}"
-        echo
-        format_output "$response" "  "
-        echo
-        save_to_memory "[Image pasted and analyzed]" "$response"
-    else
-        echo -e "${RED}${CROSS} Failed to analyze image${NC}"
-    fi
-}
-
-# Improved chat handling with better formatting
 handle_chat() {
     local input="$1"
     
-    show_typing "Thinking"
-    
-    local system_prompt="You are Cody, an AI development assistant created by Mark Hubrich. You help with coding, debugging, and development tasks. Be helpful, concise, and practical."
-    local response=$(call_gemma "$input" "$system_prompt" "0.7")
-    
-    if [ -n "$response" ]; then
-        echo -e "${BLUE}${ROBOT} Cody:${NC}"
-        echo
-        format_output "$response" "  "
-        echo
-        save_to_memory "$input" "$response"
+    if is_action_request "$input"; then
+        echo -e "${BLUE}${TARGET} Action: $input${NC}"
+        execute_action "$input"
     else
-        echo -e "${RED}${CROSS} Failed to get response${NC}"
+        show_typing "Thinking"
+        
+        local response=$(call_gemma "$input")
+        
+        if [ -n "$response" ]; then
+            echo -e "${BLUE}${ROBOT} Cody:${NC}"
+            echo
+            format_output "$response" "  "
+            echo
+            save_to_memory "$input" "$response"
+        else
+            echo -e "${RED}✗ No response${NC}"
+        fi
     fi
 }
 
-# Improved input parsing with better command handling
+# MAIN INPUT PARSER
 parse_input() {
     local input="$1"
     
-    # Skip empty input
     if [ -z "$input" ]; then
         return 0
     fi
     
     if [[ "$input" =~ ^/[a-zA-Z] ]]; then
-        # Extract command and arguments
         local command=$(echo "$input" | sed 's/^\/\([a-zA-Z]*\).*/\1/')
         local args=$(echo "$input" | sed 's/^\/[a-zA-Z]* *//')
         
-        # Handle commands that need special argument parsing
         case "$command" in
             "create")
                 local filename=$(echo "$args" | awk '{print $1}')
                 local description=$(echo "$args" | cut -d' ' -f2-)
-                if [ -z "$filename" ] || [ -z "$description" ]; then
-                    echo -e "${RED}Usage: /create <filename> <description>${NC}"
-                else
-                    handle_create "$filename" "$description"
-                fi
+                handle_create "$filename" "$description"
                 ;;
-            "edit") 
-                if [ -z "$args" ]; then
-                    echo -e "${RED}Usage: /edit <filename>${NC}"
-                else
-                    handle_edit "$args" 
-                fi
-                ;;
-            "run") 
-                if [ -z "$args" ]; then
-                    echo -e "${RED}Usage: /run <filename>${NC}"
-                else
-                    handle_run "$args"
-                fi
-                ;;
-            "explain") 
-                if [ -z "$args" ]; then
-                    echo -e "${RED}Usage: /explain <filename>${NC}"
-                else
-                    handle_explain "$args"
-                fi
-                ;;
+            "edit") handle_edit "$args" ;;
+            "run") handle_run "$args" ;;
+            "explain") handle_explain "$args" ;;
             "fix")
                 local filename=$(echo "$args" | awk '{print $1}')
                 local issue=$(echo "$args" | cut -d' ' -f2-)
-                if [ -z "$filename" ] || [ -z "$issue" ]; then
-                    echo -e "${RED}Usage: /fix <filename> <issue description>${NC}"
-                else
-                    handle_fix "$filename" "$issue"
-                fi
+                handle_fix "$filename" "$issue"
                 ;;
             "files") handle_files ;;
+            "exec") execute_command "$args" ;;
+            "selfmod") modify_self "$args" ;;
             "model") select_model ;;
-            "image") handle_image ;;
+            "reload")
+                load_system_prompt
+                echo -e "${GREEN}✓ System prompt reloaded${NC}"
+                ;;
             "clear")
                 > "$MEMORY_FILE"
-                echo -e "${YELLOW}${CHECKMARK} Conversation cleared${NC}"
+                echo -e "${YELLOW}✓ Cleared${NC}"
                 ;;
             "help") print_header ;;
             "exit"|"quit")
-                echo -e "${YELLOW}${ROCKET_ICON} Thanks for using Cody Enhanced! Goodbye!${NC}"
+                echo -e "${YELLOW}${ROCKET_ICON} Goodbye!${NC}"
                 exit 0
                 ;;
             *)
-                echo -e "${RED}Unknown command: /$command${NC}"
-                echo -e "${GRAY}Type ${BLUE}/help${NC}${GRAY} to see available commands${NC}"
+                echo -e "${RED}Unknown: /$command${NC}"
                 ;;
         esac
     else
-        # Regular chat input
         handle_chat "$input"
     fi
 }
 
-# Enhanced main loop with better error handling
+# MAIN LOOP
 main() {
-    # Setup signal handlers
     trap 'echo -e "\n${YELLOW}Goodbye!${NC}"; exit 0' INT
     trap 'print_header' WINCH
     
@@ -893,76 +776,29 @@ main() {
     done
 }
 
-# Enhanced dependency checking
-check_dependencies() {
-    local missing_deps=()
-    
-    if ! command -v curl > /dev/null; then
-        missing_deps+=("curl")
-    fi
-    
-    if ! command -v jq > /dev/null; then
-        missing_deps+=("jq")
-    fi
-    
-    if [ ${#missing_deps[@]} -gt 0 ]; then
-        echo -e "${RED}Missing dependencies: ${missing_deps[*]}${NC}"
-        echo -e "${GRAY}Install with: ${BLUE}sudo apt install ${missing_deps[*]}${NC} ${GRAY}(Ubuntu/Debian)${NC}"
-        echo -e "${GRAY}Or: ${BLUE}brew install ${missing_deps[*]}${NC} ${GRAY}(macOS)${NC}"
-        exit 1
-    fi
-}
+# STARTUP
+echo -e "${CYAN}🚀 Self-Modifying Cody${NC}"
+echo -e "${GRAY}Initializing...${NC}"
 
-# Enhanced connection testing
-test_connection() {
-    echo -e "${BLUE}Testing connection to $GEMMA_ENDPOINT...${NC}"
-    
-    local response=$(curl -s -m 5 "$GEMMA_ENDPOINT/v1/models" 2>/dev/null)
-    
-    if [ -z "$response" ]; then
-        echo -e "${RED}${CROSS} Cannot connect to $GEMMA_ENDPOINT${NC}"
-        echo -e "${GRAY}Please ensure the server is running and accessible${NC}"
-        exit 1
-    fi
-    
-    # Check if response is valid JSON
-    if ! echo "$response" | jq . >/dev/null 2>&1; then
-        echo -e "${RED}${CROSS} Invalid response from server${NC}"
-        exit 1
-    fi
-    
-    echo -e "${GREEN}${CHECKMARK} Connected successfully!${NC}"
-}
-
-# Main execution
-main_execution() {
-    echo -e "${CYAN}🚀 Cody Enhanced - AI Development Assistant${NC}"
-    echo -e "${GRAY}Created by Mark Hubrich${NC}"
-    echo
-    
-    # Check dependencies
-    check_dependencies
-    
-    # Load saved model if available
-    load_model_preference
-    
-    # Select endpoint
-    select_endpoint
-    
-    # Test connection
-    test_connection
-    
-    # Select model
-    select_model
-    
-    echo
-    sleep 1
-    
-    # Start main loop
-    main
-}
-
-# Run if executed directly
-if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
-    main_execution
+# Check dependencies
+if ! command -v curl > /dev/null || ! command -v jq > /dev/null; then
+    echo -e "${RED}Missing: curl and/or jq${NC}"
+    exit 1
 fi
+
+# Load configuration
+load_model_preference
+load_system_prompt
+select_endpoint
+
+echo -e "${BLUE}Testing connection...${NC}"
+if ! curl -s "$GEMMA_ENDPOINT/v1/models" > /dev/null; then
+    echo -e "${RED}✗ Cannot connect to $GEMMA_ENDPOINT${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}✓ Connected${NC}"
+select_model
+
+sleep 1
+main
