@@ -38,6 +38,17 @@ chmod +x cody
 # Create system prompt (optional)
 cp cody_system.txt.example cody_system.txt
 
+# Configuration
+edit the cody file...
+GEMMA_ENDPOINT="http://192.168.1.45:1234"
+OLLAMA_ENDPOINT="http://127.0.0.1:11434"
+MODEL_NAME="mistralai/codestral-22b-v0.1"
+MEMORY_FILE="$HOME/.cody_global_memory"
+HISTORY_FILE="$HOME/.cody_history"
+WORK_DIR="$(pwd)"
+SYSTEM_PROMPT=""
+MAX_BACKUPS=5
+
 # Run Cody
 ./cody
 ```
