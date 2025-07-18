@@ -24,6 +24,7 @@ HISTORY_FILE="${HISTORY_FILE:-$HOME/.cody_history}"
 WORK_DIR="${WORK_DIR:-$(pwd)}"
 SYSTEM_PROMPT=""
 MAX_BACKUPS="${MAX_BACKUPS:-5}"
+STREAM_OUTPUT="${STREAM_OUTPUT:-0}"
 
 # Colors
 RED='\033[0;31m'
@@ -260,6 +261,7 @@ print_header() {
     echo
     echo -e "${CYAN}Model:${NC} ${MODEL_NAME}"
     echo -e "${CYAN}Directory:${NC} ${WORK_DIR}"
+    echo -e "${CYAN}Streaming:${NC} ${STREAM_OUTPUT} (set STREAM_OUTPUT=1 to enable)"
     
     # System prompt with proper word wrapping
     echo -e "${CYAN}System Prompt:${NC}"
@@ -341,23 +343,31 @@ User: $prompt"
     
     local messages="[{\"role\": \"system\", \"content\": $escaped_system}, {\"role\": \"user\", \"content\": $escaped_prompt}]"
     
-    local response=$(curl -s -X POST "$GEMMA_ENDPOINT/v1/chat/completions" \
-        -H "Content-Type: application/json" \
-        -d "{
-            \"model\": \"$MODEL_NAME\",
-            \"messages\": $messages,
-            \"temperature\": $temperature,
-            \"max_tokens\": 4000
-        }" 2>/dev/null)
-    
-    if [ -n "$response" ]; then
-        local error=$(echo "$response" | jq -r '.error.message // empty' 2>/dev/null)
-        if [ -n "$error" ]; then
-            echo -e "${RED}API Error: $error${NC}" >&2
-            return 1
+    if [ "$STREAM_OUTPUT" = "1" ]; then
+        curl -s -N -X POST "$GEMMA_ENDPOINT/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -d "{\n                \"model\": \"$MODEL_NAME\",\n                \"messages\": $messages,\n                \"temperature\": $temperature,\n                \"max_tokens\": 4000,\n                \"stream\": true\n            }" 2>/dev/null | \
+        while IFS= read -r line; do
+            [[ $line == "data: "* ]] || continue
+            local chunk=${line#data: }
+            [ "$chunk" = "[DONE]" ] && break
+            echo -n "$(echo "$chunk" | jq -r -c '.choices[0].delta.content // empty')"
+        done
+        echo
+    else
+        local response=$(curl -s -X POST "$GEMMA_ENDPOINT/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -d "{\n                \"model\": \"$MODEL_NAME\",\n                \"messages\": $messages,\n                \"temperature\": $temperature,\n                \"max_tokens\": 4000\n            }" 2>/dev/null)
+
+        if [ -n "$response" ]; then
+            local error=$(echo "$response" | jq -r '.error.message // empty' 2>/dev/null)
+            if [ -n "$error" ]; then
+                echo -e "${RED}API Error: $error${NC}" >&2
+                return 1
+            fi
+
+            echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null
         fi
-        
-        echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null
     fi
 }
 
