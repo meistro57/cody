@@ -307,6 +307,7 @@ get_project_context() {
 "
     local file_count=0
     cd "$WORK_DIR" || return
+    shopt -s nullglob
     for file in *; do
         if [ -f "$file" ] && [[ ! "$file" =~ ^cody ]] && [ ${#file} -lt 50 ]; then
             local lines=$(wc -l < "$file" 2>/dev/null || echo "0")
@@ -317,6 +318,7 @@ get_project_context() {
             fi
         fi
     done
+    shopt -u nullglob
     context="$context
 Files: $file_count
 "
@@ -485,7 +487,7 @@ modify_self() {
 is_action_request() {
     local input="$1"
     
-    [[ "$input" =~ ^(rename|move|mv|create|make|delete|remove|copy|cp|chmod|mkdir|run|execute|git|add.*myself|modify.*myself|improve.*myself|apply.*upgrade|implement.*plan) ]]
+    [[ "$input" =~ ^(rename|move|mv|create|make|delete|remove|copy|cp|chmod|mkdir|run|execute|test|check|verify|try|git|add.*myself|modify.*myself|improve.*myself|apply.*upgrade|implement.*plan) ]]
 }
 
 # ACTION EXECUTOR
@@ -516,12 +518,51 @@ execute_action() {
             local dir=$(echo "$input" | sed 's/.*\(mkdir\|create directory\) \([^ ]*\).*/\2/')
             command="mkdir -p \"$dir\""
             ;;
+        *"create"*)
+            # Handle complex create commands by delegating to AI
+            echo -e "${BLUE}${TARGET} Complex create action: $input${NC}"
+            show_typing "Planning creation"
+            local response=$(call_gemma "Break down this request into specific commands: $input")
+            if [ -n "$response" ]; then
+                echo -e "${BLUE}${ROBOT} Plan:${NC}"
+                echo
+                format_output "$response" "  "
+                echo
+                # Look for specific commands in the response
+                if echo "$response" | grep -q "mkdir\|touch\|echo.*>"; then
+                    echo -e "${GREEN}${TARGET} Extracting commands...${NC}"
+                    # Extract and execute simple commands - look for lines starting with commands
+                    local commands=$(echo "$response" | grep -E "^[[:space:]]*(mkdir|touch|echo.*>)" | head -5)
+                    if [ -n "$commands" ]; then
+                        echo "$commands" | while read -r cmd; do
+                            if [ -n "$cmd" ]; then
+                                execute_command "$cmd"
+                            fi
+                        done
+                    fi
+                fi
+            fi
+            return 0
+            ;;
         *"myself"*|*"yourself"*|*"upgrade"*|*"implement"*)
             modify_self "$input"
             return 0
             ;;
         *"git "*)
             command="$input"
+            ;;
+        *"test"*|*"check"*|*"verify"*|*"try"*)
+            # Extract filename from test/check commands
+            local file=$(echo "$input" | sed -n 's/.*\(test\|check\|verify\|try\)[[:space:]]\+\([^[:space:]]\+\).*/\2/p')
+            if [ -n "$file" ]; then
+                echo -e "${BLUE}${TARGET} Testing: $file${NC}"
+                handle_run "$file"
+                return 0
+            else
+                echo -e "${YELLOW}💭 Test command unclear: $input${NC}"
+                echo -e "${GRAY}Try: 'test filename.py' or 'run filename.py'${NC}"
+                return 1
+            fi
             ;;
     esac
     
@@ -578,9 +619,10 @@ handle_create() {
 
 handle_edit() {
     local filename="$1"
+    # Remove any trailing whitespace from filename
+    filename=$(echo "$filename" | sed 's/[[:space:]]*$//')
     local target="$WORK_DIR/$filename"
 
-    cd "$WORK_DIR" 2>/dev/null || true
     if [ ! -f "$target" ]; then
         echo -e "${RED}✗ File not found: $filename${NC}"
         return 1
@@ -605,9 +647,10 @@ handle_edit() {
 
 handle_run() {
     local filename="$1"
-    local target="$WORK_DIR/$filename"
+    # Remove any trailing whitespace from filename
+    filename=$(echo "$filename" | sed 's/[[:space:]]*$//')
+    local target="$filename"
     
-    cd "$WORK_DIR" 2>/dev/null || true
     if [ ! -f "$target" ]; then
         echo -e "${RED}✗ File not found: $filename${NC}"
         return 1
@@ -616,12 +659,13 @@ handle_run() {
     echo -e "${BLUE}${ROCKET_ICON} Running $filename...${NC}"
     echo -e "${GRAY}────────────────────────────────────────${NC}"
     
+    # Already in current directory, no need to change
     case "$filename" in
-        *.py) python3 "$target" || python "$target" ;;
-        *.js) node "$target" ;;
-        *.sh) bash "$target" ;;
-        *.rb) ruby "$target" ;;
-        *.go) go run "$target" ;;
+        *.py) python3 "$filename" || python "$filename" ;;
+        *.js) node "$filename" ;;
+        *.sh) bash "$filename" ;;
+        *.rb) ruby "$filename" ;;
+        *.go) go run "$filename" ;;
         *) echo -e "${YELLOW}Unknown file type: $filename${NC}" ;;
     esac
     
@@ -631,9 +675,10 @@ handle_run() {
 
 handle_explain() {
     local filename="$1"
+    # Remove any trailing whitespace from filename
+    filename=$(echo "$filename" | sed 's/[[:space:]]*$//')
     local target="$WORK_DIR/$filename"
     
-    cd "$WORK_DIR" 2>/dev/null || true
     if [ ! -f "$target" ]; then
         echo -e "${RED}✗ File not found: $filename${NC}"
         return 1
@@ -660,11 +705,12 @@ $code"
 
 handle_fix() {
     local filename="$1"
+    # Remove any trailing whitespace from filename
+    filename=$(echo "$filename" | sed 's/[[:space:]]*$//')
     shift
     local issue="$*"
     local target="$WORK_DIR/$filename"
     
-    cd "$WORK_DIR" 2>/dev/null || true
     if [ ! -f "$target" ]; then
         echo -e "${RED}✗ File not found: $filename${NC}"
         return 1
@@ -711,6 +757,7 @@ handle_files() {
     echo
     local file_count=0 total_lines=0
     cd "$WORK_DIR" || return
+    shopt -s nullglob
     for file in * .*; do
         # Optionally skip dotfiles
         if [ $show_dotfiles -eq 0 ] && [[ "$file" == .* ]]; then
@@ -736,6 +783,7 @@ handle_files() {
             ((file_count++)); ((total_lines += lines))
         fi
     done
+    shopt -u nullglob
     echo; echo -e "${GRAY}📊 Total: ${file_count} files, ${total_lines} lines${NC}"
     if [ $show_dotfiles -eq 1 ]; then
         echo -e "${GRAY}Tip: Use '/files --no-dotfiles' to hide dotfiles.${NC}"

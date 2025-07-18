@@ -18,6 +18,7 @@ chmod +x cody            # Make executable if needed
 ```bash
 echo "/explain file.py" | ./cody    # Process single command
 echo -e "/create test.py\n/run test.py" | ./cody  # Multiple commands
+echo "test hello.py" | ./cody       # Natural language execution
 ```
 
 ### Configuration
@@ -71,9 +72,11 @@ The script uses a **two-tier parsing system**:
 1. **Slash Commands**: Direct command routing (`/create`, `/edit`, `/run`, etc.)
 2. **Natural Language Processing**: Action detection and conversion to shell commands
 
-Example flow:
+Example flows:
 ```
 "rename test.py to main.py" → is_action_request() → execute_action() → mv "test.py" "main.py"
+"test hello.py" → is_action_request() → execute_action() → handle_run("hello.py")
+"check app.py" → is_action_request() → execute_action() → handle_run("app.py")
 ```
 
 ### Interactive vs Non-Interactive Modes
@@ -152,6 +155,28 @@ The `execute_command()` function blocks dangerous patterns:
 ### Configuration Options
 New environment variables are automatically loaded from `.env` files during startup.
 
+## Recent Bug Fixes
+
+### File Listing Issue (Fixed)
+**Problem**: `/files` command showed phantom files (like `app.py`) that didn't exist, causing `/run` commands to fail.
+
+**Root Cause**: Bash glob patterns (`*`) that don't match files were left as literal strings instead of empty lists.
+
+**Fix**: Added `shopt -s nullglob` / `shopt -u nullglob` around file loops in:
+- `get_project_context()` - Used by AI for project understanding
+- `handle_files()` - Used by `/files` command
+
+### AI Execution Context Confusion (Fixed)
+**Problem**: AI would sometimes respond "I cannot execute code" instead of running commands.
+
+**Root Cause**: AI forgot it was running in an execution environment and reverted to "safe" chatbot behavior.
+
+**Fix**: Enhanced system prompt (`cody_system.txt`) with explicit execution context:
+- "You are running inside a bash script that gives you FULL command execution capabilities"
+- "You CAN and DO execute files, run commands, and modify the filesystem"
+- "NEVER say 'I cannot execute' - you CAN and SHOULD execute"
+- Added natural language parsing for `test|check|verify|try` commands
+
 ## Testing and Debugging
 
 ### Testing Commands
@@ -159,6 +184,10 @@ New environment variables are automatically loaded from `.env` files during star
 # Test individual commands
 echo "/files" | ./cody
 echo "/explain README.md" | ./cody
+
+# Test natural language execution
+echo "test hello.py" | ./cody
+echo "check app.py" | ./cody
 
 # Test with different models
 MODEL_NAME="different-model" ./cody

@@ -21,6 +21,7 @@ Cody is a command-line AI assistant that can create, edit, run, explain, and fix
 - **Self-modification**: Cody can update its own script
 - **File operations**: create, edit, run, explain, fix, and list files
 - **Shell command execution** (with safety checks)
+- **Natural language command parsing** (`test hello.py`, `check app.py`)
 - **Model and endpoint selection**
 - **Persistent memory and history**
 - **Customizable via `.env` file**
@@ -85,7 +86,11 @@ Type `/help` in Cody for a list of commands:
 - `/help` – Show help
 - `/exit` – Quit Cody
 
-You can also type natural language requests (e.g., "create a Python script that prints hello world").
+You can also type natural language requests:
+- "create a Python script that prints hello world"
+- "test hello.py" (runs the file)
+- "check app.py" (runs the file)
+- "rename old.py to new.py"
 
 ---
 
