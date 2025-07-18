@@ -126,13 +126,16 @@ select_endpoint() {
 setup_readline() {
     set -o emacs
     trap 'print_header' WINCH
-    
+
+    # Bind ESC to a custom handler that sets a flag
+    bind '"\e": " \C-u__CODY_ESC__\n"'
+
     if [ -f "$HISTORY_FILE" ]; then
         while IFS= read -r line; do
             history -s "$line"
         done < "$HISTORY_FILE"
     fi
-    
+
     bind 'set completion-ignore-case on'
     bind 'set show-all-if-ambiguous on'
     bind '"\e[A": history-search-backward'
@@ -148,16 +151,22 @@ setup_readline() {
 read_input_enhanced() {
     local input
     IFS= read -e -r input
-    
+
+    # ESC handler: if input is our special string, treat as cancel
+    if [[ "$input" == "__CODY_ESC__" ]]; then
+        echo "__CODY_ESC__"
+        return 130
+    fi
+
     if [[ -n "$input" && "$input" != " "* ]]; then
         history -s "$input"
         echo "$input" >> "$HISTORY_FILE"
-        
+
         if [ -f "$HISTORY_FILE" ] && (( $(wc -l < "$HISTORY_FILE") > 1000 )); then
             tail -n 1000 "$HISTORY_FILE" > "$HISTORY_FILE.tmp" && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
         fi
     fi
-    
+
     echo "$input"
 }
 
@@ -760,7 +769,7 @@ parse_input() {
             "edit") handle_edit "$args" ;;
             "run") handle_run "$args" ;;
             "explain") handle_explain "$args" ;;
-            "fix"
+            "fix")
                 local filename=$(echo "$args" | awk '{print $1}')
                 local issue=$(echo "$args" | cut -d' ' -f2-)
                 handle_fix "$filename" "$issue"
@@ -772,7 +781,7 @@ parse_input() {
             "exec") execute_command "$args" ;;
             "selfmod") modify_self "$args" ;;
             "model") select_model ;;
-            "reload"
+            "reload")
                 load_system_prompt
                 echo -e "${GREEN}✓ System prompt reloaded${NC}"
                 ;;
@@ -798,21 +807,29 @@ parse_input() {
 main() {
     trap 'echo -e "\n${YELLOW}Goodbye!${NC}"; exit 0' INT
     trap 'print_header' WINCH
-    
+
     setup_readline
     print_header
-    
+
     while true; do
-        printf "${GREEN}❯ ${NC}"
+        printf "${GREEN}❯${NC} "  # More distinct prompt with a space
         input=$(read_input_enhanced)
-        
+
+        # ESC pressed: cancel and return to prompt
+        if [[ "$input" == "__CODY_ESC__" ]] || [ $? -eq 130 ]; then
+            echo -e "${YELLOW}↩️  Cancelled. Back to prompt.${NC}"
+            echo -e "${GRAY}────────────────────────────────────────${NC}"  # Divider after cancel
+            continue
+        fi
+
         if [ $? -ne 0 ]; then
             echo -e "\n${YELLOW}Goodbye!${NC}"
             break
         fi
-        
+
         parse_input "$input"
-        echo
+        echo -e "${GRAY}────────────────────────────────────────${NC}"  # Divider after each command
+        echo  # Blank line for readability
     done
 }
 
