@@ -1,18 +1,29 @@
 #!/bin/bash
 
+# Load .env if present
+if [ -f "$PWD/.env" ]; then
+    set -a
+    source "$PWD/.env"
+    set +a
+elif [ -f "$HOME/.cody_env" ]; then
+    set -a
+    source "$HOME/.cody_env"
+    set +a
+fi
+
 # Cody - Self-Modifying AI Development Assistant
 # Complete version with system prompt integration and all functions working
 # Usage: ./cody
 
 # Configuration
-GEMMA_ENDPOINT="http://192.168.1.45:1234"
-OLLAMA_ENDPOINT="http://127.0.0.1:11434"
-MODEL_NAME="mistralai/codestral-22b-v0.1"
-MEMORY_FILE="$HOME/.cody_global_memory"
-HISTORY_FILE="$HOME/.cody_history"
-WORK_DIR="$(pwd)"
+GEMMA_ENDPOINT="${GEMMA_ENDPOINT:-http://10.0.0.201:1234}"
+OLLAMA_ENDPOINT="${OLLAMA_ENDPOINT:-http://127.0.0.1:11434}"
+MODEL_NAME="${MODEL_NAME:-mistralai/codestral-22b-v0.1}"
+MEMORY_FILE="${MEMORY_FILE:-$HOME/.cody_global_memory}"
+HISTORY_FILE="${HISTORY_FILE:-$HOME/.cody_history}"
+WORK_DIR="${WORK_DIR:-$(pwd)}"
 SYSTEM_PROMPT=""
-MAX_BACKUPS=5
+MAX_BACKUPS="${MAX_BACKUPS:-5}"
 
 # Colors
 RED='\033[0;31m'
@@ -25,8 +36,6 @@ WHITE='\033[1;37m'
 NC='\033[0m'
 
 # Icons
-CHECKMARK="✓"
-CROSS="✗"
 ROBOT="🤖"
 ROCKET_ICON="🚀"
 GEAR="⚙️"
@@ -106,7 +115,7 @@ select_endpoint() {
         local choice
         read -e -p "$(echo -e "${GREEN}Select server (1-${#endpoints[@]}) or Enter for default [1]: ${NC}")" choice
         if [[ $choice =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#endpoints[@]} ]; then
-            GEMMA_ENDPOINT="http://192.168.1.45:1234"
+            GEMMA_ENDPOINT="${endpoints[$((choice-1))]}"
         fi
     fi
 
@@ -328,11 +337,12 @@ call_gemma() {
     fi
 }
 
-# Extract code blocks
+# Extract code blocks (extract all code blocks, not just the first)
 extract_code() {
     local response="$1"
     if echo "$response" | grep -q '```'; then
-        echo "$response" | sed -n '/```/,/```/p' | sed '1d;$d'
+        # Extract all code blocks between triple backticks
+        echo "$response" | awk '/```/{f=!f; next} f'
     else
         echo "$response"
     fi
@@ -364,11 +374,11 @@ save_to_memory() {
 execute_command() {
     local command="$1"
     local auto_confirm="${2:-false}"
-    
+
     echo -e "${BLUE}${LIGHTNING} Executing: ${WHITE}$command${NC}"
-    
-    # Safety check
-    if [[ "$command" =~ ^(rm -rf|sudo|chmod 777|> /dev) ]]; then
+
+    # Safety check (expanded)
+    if [[ "$command" =~ (^|[[:space:]])(rm[[:space:]]+-rf|rm[[:space:]]+-fr|sudo|chmod[[:space:]]+777|>[\ \t]*/dev|dd[[:space:]]|mkfs|:(){:|:&};:|shutdown|reboot|poweroff|init[[:space:]]+0|halt|chown[[:space:]]+root|curl[[:space:]]+http|wget[[:space:]]+http|scp[[:space:]]|nc[[:space:]]|netcat[[:space:]]|:(){:|:&};:|kill[[:space:]]+-9[[:space:]]+1)($|[[:space:]]) ]]; then
         echo -e "${RED}⚠️  Dangerous command blocked${NC}"
         return 1
     fi
@@ -547,14 +557,17 @@ handle_create() {
 handle_edit() {
     local filename="$1"
     local target="$WORK_DIR/$filename"
-    
+
     cd "$WORK_DIR" 2>/dev/null || true
     if [ ! -f "$target" ]; then
         echo -e "${RED}✗ File not found: $filename${NC}"
         return 1
     fi
-    
-    if command -v code > /dev/null; then
+
+    # Prefer $EDITOR if set
+    if [ -n "$EDITOR" ] && command -v "$EDITOR" > /dev/null; then
+        "$EDITOR" "$target"
+    elif command -v code > /dev/null; then
         code "$target"
     elif command -v nano > /dev/null; then
         nano "$target"
@@ -564,7 +577,7 @@ handle_edit() {
         echo -e "${RED}No editor found${NC}"
         return 1
     fi
-    
+
     echo -e "${GREEN}✓ Edited $filename${NC}"
 }
 
@@ -655,11 +668,29 @@ handle_fix() {
 }
 
 handle_files() {
+    local show_dotfiles=1
+    local only_sources=0
+    # Parse options: --no-dotfiles, --sources
+    for arg in "$@"; do
+        case "$arg" in
+            --no-dotfiles) show_dotfiles=0 ;;
+            --sources) only_sources=1 ;;
+        esac
+    done
+
     echo -e "${BLUE}📄 Files in: ${WORK_DIR}${NC}"
     echo
     local file_count=0 total_lines=0
     cd "$WORK_DIR" || return
     for file in * .*; do
+        # Optionally skip dotfiles
+        if [ $show_dotfiles -eq 0 ] && [[ "$file" == .* ]]; then
+            continue
+        fi
+        # Optionally show only source files
+        if [ $only_sources -eq 1 ] && [[ ! "$file" =~ \.(py|js|sh|rb|go|ts|c|cpp|java|rs|pl|php|lua|swift|scala|kt|cs|hs|jl|m|r|sql|json|yaml|yml|toml|ini|cfg|xml|html|css|md|txt)$ ]]; then
+            continue
+        fi
         if [ -f "$file" ] && [ "$file" != "." ] && [ "$file" != ".." ]; then
             local lines=$(wc -l < "$file" 2>/dev/null || echo "0")
             local size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo "0")
@@ -677,6 +708,12 @@ handle_files() {
         fi
     done
     echo; echo -e "${GRAY}📊 Total: ${file_count} files, ${total_lines} lines${NC}"
+    if [ $show_dotfiles -eq 1 ]; then
+        echo -e "${GRAY}Tip: Use '/files --no-dotfiles' to hide dotfiles.${NC}"
+    fi
+    if [ $only_sources -eq 0 ]; then
+        echo -e "${GRAY}Tip: Use '/files --sources' to show only source/code files.${NC}"
+    fi
 }
 
 handle_chat() {
@@ -705,15 +742,15 @@ handle_chat() {
 # MAIN INPUT PARSER
 parse_input() {
     local input="$1"
-    
+
     if [ -z "$input" ]; then
         return 0
     fi
-    
+
     if [[ "$input" =~ ^/[a-zA-Z] ]]; then
         local command=$(echo "$input" | sed 's/^\/\([a-zA-Z]*\).*/\1/')
         local args=$(echo "$input" | sed 's/^\/[a-zA-Z]* *//')
-        
+
         case "$command" in
             "create")
                 local filename=$(echo "$args" | awk '{print $1}')
@@ -723,16 +760,19 @@ parse_input() {
             "edit") handle_edit "$args" ;;
             "run") handle_run "$args" ;;
             "explain") handle_explain "$args" ;;
-            "fix")
+            "fix"
                 local filename=$(echo "$args" | awk '{print $1}')
                 local issue=$(echo "$args" | cut -d' ' -f2-)
                 handle_fix "$filename" "$issue"
                 ;;
-            "files") handle_files ;;
+            "files")
+                # Allow /files --no-dotfiles and /files --sources
+                handle_files $args
+                ;;
             "exec") execute_command "$args" ;;
             "selfmod") modify_self "$args" ;;
             "model") select_model ;;
-            "reload")
+            "reload"
                 load_system_prompt
                 echo -e "${GREEN}✓ System prompt reloaded${NC}"
                 ;;
