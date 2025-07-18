@@ -103,6 +103,13 @@ select_endpoint() {
         names+=("Ollama ($OLLAMA_ENDPOINT)")
     fi
 
+    # Check if we're in non-interactive mode
+    if [ ! -t 0 ]; then
+        # Non-interactive mode: use default endpoint
+        echo -e "${GREEN}✓ Using endpoint: $GEMMA_ENDPOINT${NC}"
+        return
+    fi
+
     if [ ${#endpoints[@]} -gt 1 ]; then
         echo -e "${BLUE}Available servers:${NC}"
         local i=1
@@ -296,19 +303,23 @@ show_typing() {
 
 # Project context
 get_project_context() {
-    local context="Project: $WORK_DIR\n"
+    local context="Project: $WORK_DIR
+"
     local file_count=0
     cd "$WORK_DIR" || return
     for file in *; do
         if [ -f "$file" ] && [[ ! "$file" =~ ^cody ]] && [ ${#file} -lt 50 ]; then
             local lines=$(wc -l < "$file" 2>/dev/null || echo "0")
             if [ "$lines" -lt 200 ]; then
-                context="$context- $file ($lines lines)\n"
+                context="$context- $file ($lines lines)
+"
                 ((file_count++))
             fi
         fi
     done
-    context="$context\nFiles: $file_count\n"
+    context="$context
+Files: $file_count
+"
     echo -e "$context"
 }
 
@@ -319,7 +330,9 @@ call_gemma() {
     local temperature="${3:-0.7}"
     
     local context=$(get_project_context)
-    local full_prompt="$context\n\nUser: $prompt"
+    local full_prompt="$context
+
+User: $prompt"
     
     local escaped_prompt=$(echo "$full_prompt" | jq -Rs .)
     local escaped_system=$(echo "$custom_system_prompt" | jq -Rs .)
@@ -629,7 +642,9 @@ handle_explain() {
     show_typing "Analyzing $filename"
     
     local code=$(cat "$target")
-    local explain_prompt="Explain this code clearly and concisely:\n\n$code"
+    local explain_prompt="Explain this code clearly and concisely:
+
+$code"
     local response=$(call_gemma "$explain_prompt" "" "0.5")
     
     if [ -n "$response" ]; then
@@ -658,7 +673,12 @@ handle_fix() {
     show_typing "Fixing $filename"
     
     local code=$(cat "$target")
-    local fix_prompt="Fix this code to resolve: $issue\n\nCode:\n$code\n\nReturn only the complete fixed code."
+    local fix_prompt="Fix this code to resolve: $issue
+
+Code:
+$code
+
+Return only the complete fixed code."
     local response=$(call_gemma "$fix_prompt" "" "0.3")
     
     if [ -n "$response" ]; then
@@ -808,6 +828,15 @@ main() {
     trap 'echo -e "\n${YELLOW}Goodbye!${NC}"; exit 0' INT
     trap 'print_header' WINCH
 
+    # Check if we're running non-interactively (piped input)
+    if [ ! -t 0 ]; then
+        # Non-interactive mode: read from stdin and process each line
+        while IFS= read -r input; do
+            parse_input "$input"
+        done
+        exit 0
+    fi
+
     setup_readline
     print_header
 
@@ -834,28 +863,50 @@ main() {
 }
 
 # STARTUP
-echo -e "${CYAN}🚀 Self-Modifying Cody${NC}"
-echo -e "${GRAY}Initializing...${NC}"
+# Check if we're running non-interactively (piped input)
+if [ ! -t 0 ]; then
+    # Non-interactive mode: minimal startup
+    if ! command -v curl > /dev/null || ! command -v jq > /dev/null; then
+        echo -e "${RED}Missing: curl and/or jq${NC}"
+        exit 1
+    fi
+    
+    load_model_preference
+    load_system_prompt
+    select_endpoint
+    
+    # Quick connection test
+    if ! curl -s "$GEMMA_ENDPOINT/v1/models" > /dev/null; then
+        echo -e "${RED}✗ Cannot connect to $GEMMA_ENDPOINT${NC}"
+        exit 1
+    fi
+    
+    main
+else
+    # Interactive mode: full startup
+    echo -e "${CYAN}🚀 Self-Modifying Cody${NC}"
+    echo -e "${GRAY}Initializing...${NC}"
 
-# Check dependencies
-if ! command -v curl > /dev/null || ! command -v jq > /dev/null; then
-    echo -e "${RED}Missing: curl and/or jq${NC}"
-    exit 1
+    # Check dependencies
+    if ! command -v curl > /dev/null || ! command -v jq > /dev/null; then
+        echo -e "${RED}Missing: curl and/or jq${NC}"
+        exit 1
+    fi
+
+    # Load configuration
+    load_model_preference
+    load_system_prompt
+    select_endpoint
+
+    echo -e "${BLUE}Testing connection...${NC}"
+    if ! curl -s "$GEMMA_ENDPOINT/v1/models" > /dev/null; then
+        echo -e "${RED}✗ Cannot connect to $GEMMA_ENDPOINT${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}✓ Connected${NC}"
+    select_model
+
+    sleep 1
+    main
 fi
-
-# Load configuration
-load_model_preference
-load_system_prompt
-select_endpoint
-
-echo -e "${BLUE}Testing connection...${NC}"
-if ! curl -s "$GEMMA_ENDPOINT/v1/models" > /dev/null; then
-    echo -e "${RED}✗ Cannot connect to $GEMMA_ENDPOINT${NC}"
-    exit 1
-fi
-
-echo -e "${GREEN}✓ Connected${NC}"
-select_model
-
-sleep 1
-main
