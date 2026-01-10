@@ -1,4 +1,5 @@
 #!/bin/bash
+# cody
 
 # Load .env if present
 if [ -f "$PWD/.env" ]; then
@@ -24,6 +25,8 @@ HISTORY_FILE="${HISTORY_FILE:-$HOME/.cody_history}"
 WORK_DIR="${WORK_DIR:-$(pwd)}"
 SYSTEM_PROMPT=""
 MAX_BACKUPS="${MAX_BACKUPS:-5}"
+API_TIMEOUT="${API_TIMEOUT:-30}"
+CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-5}"
 
 # Colors
 RED='\033[0;31m'
@@ -56,6 +59,48 @@ load_system_prompt() {
     fi
 }
 
+# Verify work directory exists
+validate_work_dir() {
+    if [ ! -d "$WORK_DIR" ]; then
+        echo -e "${YELLOW}⚠️ WORK_DIR not found: $WORK_DIR${NC}"
+        WORK_DIR="$(pwd)"
+        echo -e "${GREEN}✓ Using current directory: $WORK_DIR${NC}"
+    fi
+}
+
+# Ensure dependencies are available
+ensure_dependencies() {
+    local missing=()
+    command -v curl > /dev/null || missing+=("curl")
+    command -v jq > /dev/null || missing+=("jq")
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo -e "${RED}Missing dependencies: ${missing[*]}${NC}"
+        return 1
+    fi
+}
+
+# Test endpoint connectivity
+test_endpoint() {
+    local endpoint="$1"
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        --connect-timeout "$CONNECT_TIMEOUT" \
+        --max-time "$API_TIMEOUT" \
+        "$endpoint/v1/models" 2>/dev/null)
+
+    if [[ "$http_code" =~ ^2 ]]; then
+        return 0
+    fi
+
+    if [ -z "$http_code" ] || [ "$http_code" = "000" ]; then
+        echo -e "${RED}✗ Cannot connect to $endpoint${NC}"
+    else
+        echo -e "${RED}✗ Endpoint returned HTTP $http_code from $endpoint${NC}"
+    fi
+    return 1
+}
+
 # Manage backup files - keep only MAX_BACKUPS
 manage_backups() {
     local backup_pattern="$0.backup.*"
@@ -82,7 +127,10 @@ load_model_preference() {
 # Fetch available models
 fetch_available_models() {
     AVAILABLE_MODELS=()
-    local resp=$(curl -s "$GEMMA_ENDPOINT/v1/models" 2>/dev/null)
+    local resp=$(curl -s \
+        --connect-timeout "$CONNECT_TIMEOUT" \
+        --max-time "$API_TIMEOUT" \
+        "$GEMMA_ENDPOINT/v1/models" 2>/dev/null)
     if [ -n "$resp" ]; then
         mapfile -t AVAILABLE_MODELS < <(echo "$resp" | jq -r '..|.id? // empty' | sort -u)
     fi
@@ -90,7 +138,10 @@ fetch_available_models() {
 
 # Detect Ollama
 detect_ollama() {
-    curl -s "$OLLAMA_ENDPOINT/v1/models" >/dev/null 2>&1
+    curl -s \
+        --connect-timeout "$CONNECT_TIMEOUT" \
+        --max-time "$API_TIMEOUT" \
+        "$OLLAMA_ENDPOINT/v1/models" >/dev/null 2>&1
 }
 
 # Select endpoint
@@ -256,6 +307,7 @@ print_header() {
     echo -e "  ${BLUE}/exec${NC} <command>                   ${GRAY}Execute shell command${NC}"
     echo -e "  ${BLUE}/selfmod${NC} <description>            ${GRAY}Modify myself${NC}"
     echo -e "  ${BLUE}/reload${NC}                           ${GRAY}Reload system prompt${NC}"
+    echo -e "  ${BLUE}/status${NC}                           ${GRAY}Show endpoint status${NC}"
     echo -e "  ${BLUE}/model${NC} | ${BLUE}/clear${NC} | ${BLUE}/help${NC} | ${BLUE}/exit${NC}"
     echo
     echo -e "${CYAN}Model:${NC} ${MODEL_NAME}"
@@ -341,23 +393,41 @@ User: $prompt"
     
     local messages="[{\"role\": \"system\", \"content\": $escaped_system}, {\"role\": \"user\", \"content\": $escaped_prompt}]"
     
-    local response=$(curl -s -X POST "$GEMMA_ENDPOINT/v1/chat/completions" \
+    local response
+    response=$(curl -s -w "\n%{http_code}" -X POST "$GEMMA_ENDPOINT/v1/chat/completions" \
         -H "Content-Type: application/json" \
+        --connect-timeout "$CONNECT_TIMEOUT" \
+        --max-time "$API_TIMEOUT" \
         -d "{
             \"model\": \"$MODEL_NAME\",
             \"messages\": $messages,
             \"temperature\": $temperature,
             \"max_tokens\": 4000
         }" 2>/dev/null)
-    
+
     if [ -n "$response" ]; then
-        local error=$(echo "$response" | jq -r '.error.message // empty' 2>/dev/null)
+        local http_code=$(echo "$response" | tail -n 1)
+        local body=$(echo "$response" | sed '$d')
+
+        if [[ ! "$http_code" =~ ^2 ]]; then
+            if [ -z "$http_code" ] || [ "$http_code" = "000" ]; then
+                echo -e "${RED}API Error: Connection failed${NC}" >&2
+            else
+                echo -e "${RED}API Error: HTTP $http_code${NC}" >&2
+            fi
+            return 1
+        fi
+
+        local error=$(echo "$body" | jq -r '.error.message // empty' 2>/dev/null)
         if [ -n "$error" ]; then
             echo -e "${RED}API Error: $error${NC}" >&2
             return 1
         fi
         
-        echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null
+        echo "$body" | jq -r '.choices[0].message.content // empty' 2>/dev/null
+    else
+        echo -e "${RED}API Error: Empty response${NC}" >&2
+        return 1
     fi
 }
 
@@ -793,6 +863,18 @@ handle_files() {
     fi
 }
 
+handle_status() {
+    echo -e "${BLUE}📡 Status${NC}"
+    echo -e "${CYAN}Model:${NC} ${MODEL_NAME}"
+    echo -e "${CYAN}Directory:${NC} ${WORK_DIR}"
+    echo -e "${CYAN}Endpoint:${NC} ${GEMMA_ENDPOINT}"
+    if test_endpoint "$GEMMA_ENDPOINT"; then
+        echo -e "${GREEN}✓ Endpoint reachable${NC}"
+    else
+        echo -e "${RED}✗ Endpoint unreachable${NC}"
+    fi
+}
+
 handle_chat() {
     local input="$1"
     
@@ -849,6 +931,7 @@ parse_input() {
             "exec") execute_command "$args" ;;
             "selfmod") modify_self "$args" ;;
             "model") select_model ;;
+            "status") handle_status ;;
             "reload")
                 load_system_prompt
                 echo -e "${GREEN}✓ System prompt reloaded${NC}"
@@ -914,18 +997,17 @@ main() {
 # Check if we're running non-interactively (piped input)
 if [ ! -t 0 ]; then
     # Non-interactive mode: minimal startup
-    if ! command -v curl > /dev/null || ! command -v jq > /dev/null; then
-        echo -e "${RED}Missing: curl and/or jq${NC}"
+    if ! ensure_dependencies; then
         exit 1
     fi
     
     load_model_preference
     load_system_prompt
+    validate_work_dir
     select_endpoint
     
     # Quick connection test
-    if ! curl -s "$GEMMA_ENDPOINT/v1/models" > /dev/null; then
-        echo -e "${RED}✗ Cannot connect to $GEMMA_ENDPOINT${NC}"
+    if ! test_endpoint "$GEMMA_ENDPOINT"; then
         exit 1
     fi
     
@@ -936,19 +1018,18 @@ else
     echo -e "${GRAY}Initializing...${NC}"
 
     # Check dependencies
-    if ! command -v curl > /dev/null || ! command -v jq > /dev/null; then
-        echo -e "${RED}Missing: curl and/or jq${NC}"
+    if ! ensure_dependencies; then
         exit 1
     fi
 
     # Load configuration
     load_model_preference
     load_system_prompt
+    validate_work_dir
     select_endpoint
 
     echo -e "${BLUE}Testing connection...${NC}"
-    if ! curl -s "$GEMMA_ENDPOINT/v1/models" > /dev/null; then
-        echo -e "${RED}✗ Cannot connect to $GEMMA_ENDPOINT${NC}"
+    if ! test_endpoint "$GEMMA_ENDPOINT"; then
         exit 1
     fi
 
