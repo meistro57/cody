@@ -19,7 +19,13 @@ fi
 # Configuration
 GEMMA_ENDPOINT="${GEMMA_ENDPOINT:-http://10.0.0.201:1234}"
 OLLAMA_ENDPOINT="${OLLAMA_ENDPOINT:-http://127.0.0.1:11434}"
+OPENROUTER_ENDPOINT="${OPENROUTER_ENDPOINT:-https://openrouter.ai/api/v1}"
+OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
+OPENROUTER_APP_NAME="${OPENROUTER_APP_NAME:-Cody}"
+OPENROUTER_HTTP_REFERER="${OPENROUTER_HTTP_REFERER:-}"
 MODEL_NAME="${MODEL_NAME:-mistralai/codestral-22b-v0.1}"
+API_PROVIDER="${API_PROVIDER:-lmstudio}"
+PROVIDER_NAME=""
 MEMORY_FILE="${MEMORY_FILE:-$HOME/.cody_global_memory}"
 HISTORY_FILE="${HISTORY_FILE:-$HOME/.cody_history}"
 WORK_DIR="${WORK_DIR:-$(pwd)}"
@@ -80,11 +86,41 @@ ensure_dependencies() {
     fi
 }
 
+# Build request headers for API calls
+build_request_headers() {
+    local -n headers_ref=$1
+    headers_ref=("-H" "Content-Type: application/json")
+
+    if [ "$API_PROVIDER" = "openrouter" ]; then
+        if [ -z "$OPENROUTER_API_KEY" ]; then
+            echo -e "${RED}✗ OPENROUTER_API_KEY not set${NC}" >&2
+            return 1
+        fi
+        headers_ref+=("-H" "Authorization: Bearer $OPENROUTER_API_KEY")
+        if [ -n "$OPENROUTER_HTTP_REFERER" ]; then
+            headers_ref+=("-H" "HTTP-Referer: $OPENROUTER_HTTP_REFERER")
+        fi
+        if [ -n "$OPENROUTER_APP_NAME" ]; then
+            headers_ref+=("-H" "X-Title: $OPENROUTER_APP_NAME")
+        fi
+    fi
+}
+
 # Test endpoint connectivity
 test_endpoint() {
     local endpoint="$1"
+    local provider="${2:-$API_PROVIDER}"
     local http_code
+    local headers=()
+
+    if [ "$provider" = "openrouter" ]; then
+        if ! build_request_headers headers; then
+            return 1
+        fi
+    fi
+
     http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        "${headers[@]}" \
         --connect-timeout "$CONNECT_TIMEOUT" \
         --max-time "$API_TIMEOUT" \
         "$endpoint/v1/models" 2>/dev/null)
@@ -124,15 +160,32 @@ load_model_preference() {
     fi
 }
 
+# Load saved provider preference
+load_provider_preference() {
+    if [ -f "$HOME/.cody_provider" ]; then
+        PROVIDER_NAME=$(cat "$HOME/.cody_provider")
+    fi
+}
+
 # Fetch available models
 fetch_available_models() {
     AVAILABLE_MODELS=()
+    local headers=()
+    if ! build_request_headers headers; then
+        return 1
+    fi
+
     local resp=$(curl -s \
+        "${headers[@]}" \
         --connect-timeout "$CONNECT_TIMEOUT" \
         --max-time "$API_TIMEOUT" \
         "$GEMMA_ENDPOINT/v1/models" 2>/dev/null)
     if [ -n "$resp" ]; then
-        mapfile -t AVAILABLE_MODELS < <(echo "$resp" | jq -r '..|.id? // empty' | sort -u)
+        if [ "$API_PROVIDER" = "openrouter" ]; then
+            mapfile -t AVAILABLE_MODELS < <(echo "$resp" | jq -r '.data[].id // empty' | sort -u)
+        else
+            mapfile -t AVAILABLE_MODELS < <(echo "$resp" | jq -r '..|.id? // empty' | sort -u)
+        fi
     fi
 }
 
@@ -148,15 +201,37 @@ detect_ollama() {
 select_endpoint() {
     local endpoints=("$GEMMA_ENDPOINT")
     local names=("LM Studio ($GEMMA_ENDPOINT)")
+    local providers=("lmstudio")
 
     if detect_ollama; then
         endpoints+=("$OLLAMA_ENDPOINT")
         names+=("Ollama ($OLLAMA_ENDPOINT)")
+        providers+=("ollama")
+    fi
+
+    if [ -n "$OPENROUTER_API_KEY" ]; then
+        endpoints+=("$OPENROUTER_ENDPOINT")
+        names+=("OpenRouter ($OPENROUTER_ENDPOINT)")
+        providers+=("openrouter")
     fi
 
     # Check if we're in non-interactive mode
     if [ ! -t 0 ]; then
-        # Non-interactive mode: use default endpoint
+        case "$API_PROVIDER" in
+            openrouter)
+                if [ -z "$OPENROUTER_API_KEY" ]; then
+                    echo -e "${RED}✗ OPENROUTER_API_KEY not set${NC}"
+                    return 1
+                fi
+                GEMMA_ENDPOINT="$OPENROUTER_ENDPOINT"
+                ;;
+            ollama)
+                GEMMA_ENDPOINT="$OLLAMA_ENDPOINT"
+                ;;
+            *)
+                API_PROVIDER="lmstudio"
+                ;;
+        esac
         echo -e "${GREEN}✓ Using endpoint: $GEMMA_ENDPOINT${NC}"
         return
     fi
@@ -174,6 +249,7 @@ select_endpoint() {
         read -e -p "$(echo -e "${GREEN}Select server (1-${#endpoints[@]}) or Enter for default [1]: ${NC}")" choice
         if [[ $choice =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#endpoints[@]} ]; then
             GEMMA_ENDPOINT="${endpoints[$((choice-1))]}"
+            API_PROVIDER="${providers[$((choice-1))]}"
         fi
     fi
 
@@ -259,6 +335,28 @@ select_model() {
     fi
 }
 
+# Provider selection (OpenRouter)
+select_provider() {
+    if [ "$API_PROVIDER" != "openrouter" ]; then
+        echo -e "${YELLOW}Provider selection is only available with OpenRouter${NC}"
+        return 1
+    fi
+
+    local current_provider="${PROVIDER_NAME:-auto}"
+    local choice
+    read -e -p "$(echo -e "${GREEN}Enter provider name or press Enter for auto [${current_provider}]: ${NC}")" choice
+
+    if [ -z "$choice" ]; then
+        PROVIDER_NAME=""
+        rm -f "$HOME/.cody_provider"
+        echo -e "${GREEN}✓ Provider set to auto${NC}"
+    else
+        PROVIDER_NAME="$choice"
+        echo "$PROVIDER_NAME" > "$HOME/.cody_provider"
+        echo -e "${GREEN}✓ Provider set to: $PROVIDER_NAME${NC}"
+    fi
+}
+
 # Header with proper word wrapping
 print_header() {
     clear
@@ -305,12 +403,17 @@ print_header() {
     echo -e "  ${BLUE}/fix${NC} <filename> <issue>           ${GRAY}Fix code${NC}"
     echo -e "  ${BLUE}/files${NC}                            ${GRAY}List files${NC}"
     echo -e "  ${BLUE}/exec${NC} <command>                   ${GRAY}Execute shell command${NC}"
+    echo -e "  ${BLUE}/pip${NC} <args> | ${BLUE}/npm${NC} <args> | ${BLUE}/pnpm${NC} <args> | ${BLUE}/yarn${NC} <args>"
     echo -e "  ${BLUE}/selfmod${NC} <description>            ${GRAY}Modify myself${NC}"
     echo -e "  ${BLUE}/reload${NC}                           ${GRAY}Reload system prompt${NC}"
     echo -e "  ${BLUE}/status${NC}                           ${GRAY}Show endpoint status${NC}"
-    echo -e "  ${BLUE}/model${NC} | ${BLUE}/clear${NC} | ${BLUE}/help${NC} | ${BLUE}/exit${NC}"
+    echo -e "  ${BLUE}/model${NC} | ${BLUE}/provider${NC} | ${BLUE}/clear${NC} | ${BLUE}/help${NC} | ${BLUE}/exit${NC}"
     echo
     echo -e "${CYAN}Model:${NC} ${MODEL_NAME}"
+    if [ "$API_PROVIDER" = "openrouter" ]; then
+        local provider_label="${PROVIDER_NAME:-auto}"
+        echo -e "${CYAN}Provider:${NC} ${provider_label}"
+    fi
     echo -e "${CYAN}Directory:${NC} ${WORK_DIR}"
     
     # System prompt with proper word wrapping
@@ -393,16 +496,26 @@ User: $prompt"
     
     local messages="[{\"role\": \"system\", \"content\": $escaped_system}, {\"role\": \"user\", \"content\": $escaped_prompt}]"
     
+    local headers=()
+    if ! build_request_headers headers; then
+        return 1
+    fi
+
+    local provider_payload=""
+    if [ "$API_PROVIDER" = "openrouter" ] && [ -n "$PROVIDER_NAME" ]; then
+        provider_payload=", \"provider\": {\"order\": [\"$PROVIDER_NAME\"], \"allow_fallbacks\": true}"
+    fi
+
     local response
     response=$(curl -s -w "\n%{http_code}" -X POST "$GEMMA_ENDPOINT/v1/chat/completions" \
-        -H "Content-Type: application/json" \
+        "${headers[@]}" \
         --connect-timeout "$CONNECT_TIMEOUT" \
         --max-time "$API_TIMEOUT" \
         -d "{
             \"model\": \"$MODEL_NAME\",
             \"messages\": $messages,
             \"temperature\": $temperature,
-            \"max_tokens\": 4000
+            \"max_tokens\": 4000${provider_payload}
         }" 2>/dev/null)
 
     if [ -n "$response" ]; then
@@ -502,6 +615,75 @@ execute_command() {
     return $exit_code
 }
 
+# PACKAGE MANAGER HELPERS
+run_pip_command() {
+    local args="$1"
+    local pip_cmd=""
+
+    if command -v python3 > /dev/null; then
+        pip_cmd="python3 -m pip"
+    elif command -v pip3 > /dev/null; then
+        pip_cmd="pip3"
+    elif command -v pip > /dev/null; then
+        pip_cmd="pip"
+    else
+        echo -e "${RED}✗ pip not available${NC}"
+        return 1
+    fi
+
+    if [ -z "$args" ]; then
+        echo -e "${YELLOW}Usage: /pip <args>${NC}"
+        return 1
+    fi
+
+    execute_command "$pip_cmd $args"
+}
+
+run_npm_command() {
+    local args="$1"
+    if ! command -v npm > /dev/null; then
+        echo -e "${RED}✗ npm not available${NC}"
+        return 1
+    fi
+
+    if [ -z "$args" ]; then
+        echo -e "${YELLOW}Usage: /npm <args>${NC}"
+        return 1
+    fi
+
+    execute_command "npm $args"
+}
+
+run_pnpm_command() {
+    local args="$1"
+    if ! command -v pnpm > /dev/null; then
+        echo -e "${RED}✗ pnpm not available${NC}"
+        return 1
+    fi
+
+    if [ -z "$args" ]; then
+        echo -e "${YELLOW}Usage: /pnpm <args>${NC}"
+        return 1
+    fi
+
+    execute_command "pnpm $args"
+}
+
+run_yarn_command() {
+    local args="$1"
+    if ! command -v yarn > /dev/null; then
+        echo -e "${RED}✗ yarn not available${NC}"
+        return 1
+    fi
+
+    if [ -z "$args" ]; then
+        echo -e "${YELLOW}Usage: /yarn <args>${NC}"
+        return 1
+    fi
+
+    execute_command "yarn $args"
+}
+
 # SELF-MODIFICATION ENGINE
 modify_self() {
     local description="$1"
@@ -557,7 +739,7 @@ modify_self() {
 is_action_request() {
     local input="$1"
     
-    [[ "$input" =~ ^(rename|move|mv|create|make|delete|remove|copy|cp|chmod|mkdir|run|execute|test|check|verify|try|git|add.*myself|modify.*myself|improve.*myself|apply.*upgrade|implement.*plan) ]]
+    [[ "$input" =~ ^(rename|move|mv|create|make|delete|remove|copy|cp|chmod|mkdir|run|execute|test|check|verify|try|git|pip|pip3|python[[:space:]]+-m[[:space:]]+pip|npm|pnpm|yarn|add.*myself|modify.*myself|improve.*myself|apply.*upgrade|implement.*plan) ]]
 }
 
 # ACTION EXECUTOR
@@ -616,6 +798,31 @@ execute_action() {
             ;;
         *"myself"*|*"yourself"*|*"upgrade"*|*"implement"*)
             modify_self "$input"
+            return 0
+            ;;
+        pip\ *)
+            run_pip_command "${input#pip }"
+            return 0
+            ;;
+        pip3\ *)
+            run_pip_command "${input#pip3 }"
+            return 0
+            ;;
+        python\ -m\ pip\ *)
+            local pip_args="${input#python -m pip }"
+            run_pip_command "$pip_args"
+            return 0
+            ;;
+        npm\ *)
+            run_npm_command "${input#npm }"
+            return 0
+            ;;
+        pnpm\ *)
+            run_pnpm_command "${input#pnpm }"
+            return 0
+            ;;
+        yarn\ *)
+            run_yarn_command "${input#yarn }"
             return 0
             ;;
         *"git "*)
@@ -866,9 +1073,13 @@ handle_files() {
 handle_status() {
     echo -e "${BLUE}📡 Status${NC}"
     echo -e "${CYAN}Model:${NC} ${MODEL_NAME}"
+    if [ "$API_PROVIDER" = "openrouter" ]; then
+        local provider_label="${PROVIDER_NAME:-auto}"
+        echo -e "${CYAN}Provider:${NC} ${provider_label}"
+    fi
     echo -e "${CYAN}Directory:${NC} ${WORK_DIR}"
     echo -e "${CYAN}Endpoint:${NC} ${GEMMA_ENDPOINT}"
-    if test_endpoint "$GEMMA_ENDPOINT"; then
+    if test_endpoint "$GEMMA_ENDPOINT" "$API_PROVIDER"; then
         echo -e "${GREEN}✓ Endpoint reachable${NC}"
     else
         echo -e "${RED}✗ Endpoint unreachable${NC}"
@@ -929,8 +1140,13 @@ parse_input() {
                 handle_files $args
                 ;;
             "exec") execute_command "$args" ;;
+            "pip") run_pip_command "$args" ;;
+            "npm") run_npm_command "$args" ;;
+            "pnpm") run_pnpm_command "$args" ;;
+            "yarn") run_yarn_command "$args" ;;
             "selfmod") modify_self "$args" ;;
             "model") select_model ;;
+            "provider") select_provider ;;
             "status") handle_status ;;
             "reload")
                 load_system_prompt
@@ -1002,12 +1218,13 @@ if [ ! -t 0 ]; then
     fi
     
     load_model_preference
+    load_provider_preference
     load_system_prompt
     validate_work_dir
     select_endpoint
     
     # Quick connection test
-    if ! test_endpoint "$GEMMA_ENDPOINT"; then
+    if ! test_endpoint "$GEMMA_ENDPOINT" "$API_PROVIDER"; then
         exit 1
     fi
     
@@ -1024,12 +1241,13 @@ else
 
     # Load configuration
     load_model_preference
+    load_provider_preference
     load_system_prompt
     validate_work_dir
     select_endpoint
 
     echo -e "${BLUE}Testing connection...${NC}"
-    if ! test_endpoint "$GEMMA_ENDPOINT"; then
+    if ! test_endpoint "$GEMMA_ENDPOINT" "$API_PROVIDER"; then
         exit 1
     fi
 
