@@ -75,6 +75,8 @@ This document outlines proposed enhancements and additional features for Cody. T
   - Curated examples for typical development tasks.
 - **Troubleshooting playbooks**
   - Common failures and how to resolve them.
+- **Changelog notes**
+  - Short release notes bundled in `README.md` or `CHANGELOG.md`.
 
 ---
 
