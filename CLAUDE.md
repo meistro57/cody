@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Cody is a self-modifying AI development assistant that operates as a bash script. It can execute commands, modify its own code, and interact with local LLM endpoints for AI functionality.
+Cody is a self-modifying AI development assistant that operates as a Bash script. It can execute commands, modify its own code, and interact with local LLM endpoints for AI functionality.
 
 ## Key Commands
 
@@ -35,7 +35,7 @@ cp env.example .env      # Create configuration file
 ## Architecture
 
 ### Core Script Structure
-Cody uses a **monolithic bash architecture** with clear functional separation:
+Cody uses a **monolithic Bash architecture** with clear functional separation:
 
 - **Configuration Layer** (lines 3-26): Environment loading, endpoint configuration
 - **Core Engine Layer** (lines 45-393): System prompt management, API communication

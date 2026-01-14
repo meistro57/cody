@@ -8,14 +8,15 @@
 ╚██████╗╚██████╔╝██████╔╝   ██║   
  ╚═════╝ ╚═════╝ ╚═════╝    ╚═╝
 ```
+
 *Customizable Open-Source Development Yoda*  
 *"The force is strong in this one..."*
 
 Cody is a command-line AI assistant that can create, edit, run, explain, and fix code files, as well as self-modify its own script. It integrates with local LLM endpoints (such as LM Studio or Ollama) and supports project context awareness.
 
 ---
-<img width="1110" height="626" alt="image" src="https://github.com/user-attachments/assets/c7c00380-f11d-4735-a43e-24bc849f2a01" />
 
+<img width="1110" height="626" alt="image" src="https://github.com/user-attachments/assets/c7c00380-f11d-4735-a43e-24bc849f2a01" />
 
 ## Features
 
@@ -111,6 +112,15 @@ You can also type natural language requests:
 - Dangerous shell commands are blocked by default.
 - Self-modification creates backups (see `MAX_BACKUPS`).
 - Cody will prompt before executing most actions.
+
+See [DISCLAIMER.md](DISCLAIMER.md) for the full safety notice.
+
+---
+
+## Project Docs
+
+- [CLAUDE.md](CLAUDE.md) – Architecture notes and development guidance.
+- [DISCLAIMER.md](DISCLAIMER.md) – Safety and liability notice.
 
 ---
 
