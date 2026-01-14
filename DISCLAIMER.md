@@ -2,12 +2,12 @@
 
 ## Important Notice
 
-**Cody is an experimental self-modifying AI assistant that executes shell commands and modifies code automatically.** 
+**Cody is an experimental self-modifying AI assistant that executes shell commands and modifies code automatically.**
 
 ### 🚨 **USE AT YOUR OWN RISK**
 
-- **Cody executes commands directly on your system** - it can create, modify, delete files
-- **Cody can modify its own source code** - behavior may change unexpectedly
+- **Cody executes commands directly on your system** - it can create, modify, or delete files
+- **Cody can modify its own source code** - behaviour may change unexpectedly
 - **No warranty or guarantee** of safety, security, or correctness
 - **Always review generated code** before execution in production environments
 - **Run in isolated environments** when testing new features
