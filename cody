@@ -38,6 +38,8 @@ PROFILE_NAME=""
 ONBOARDING_FLAG="${ONBOARDING_FLAG:-$HOME/.cody_onboarded}"
 DEFAULT_PROFILE_MEMORY_DIR="${DEFAULT_PROFILE_MEMORY_DIR:-$HOME}"
 AGENTS_DIR="${AGENTS_DIR:-$HOME/.cody_agents}"
+SANDBOX_ROOT="${SANDBOX_ROOT:-$HOME/.cody_sandboxes}"
+SANDBOX_AUTO_VENV="${SANDBOX_AUTO_VENV:-1}"
 
 # Colors
 RED='\033[0;31m'
@@ -59,7 +61,7 @@ TARGET="🎯"
 DEFAULT_COMMANDS=(
     "/create" "/edit" "/run" "/explain" "/fix" "/files" "/exec"
     "/pip" "/npm" "/pnpm" "/yarn" "/selfmod" "/reload" "/status"
-    "/doctor" "/model" "/provider" "/clear" "/help" "/profile" "/agent" "/wizard" "/exit"
+    "/doctor" "/model" "/provider" "/clear" "/help" "/profile" "/agent" "/sandbox" "/wizard" "/exit"
 )
 
 FILE_COMMANDS=("/create" "/edit" "/run" "/explain" "/fix")
@@ -387,6 +389,679 @@ agent_logs() {
 
     echo -e "${BLUE}📜 Logs (${name})${NC}"
     tail -n 50 "$log_file"
+}
+
+# Sandbox helpers
+ensure_sandbox_root() {
+    mkdir -p "$SANDBOX_ROOT"
+}
+
+is_valid_sandbox_name() {
+    local name="$1"
+    [[ "$name" =~ ^[a-zA-Z0-9._-]+$ ]]
+}
+
+sandbox_dir_for() {
+    local name="$1"
+    echo "$SANDBOX_ROOT/$name"
+}
+
+maybe_create_venv() {
+    local dir="$1"
+    local enabled="$2"
+    if [ "$enabled" -ne 1 ]; then
+        return 0
+    fi
+
+    if ! command -v python3 > /dev/null 2>&1; then
+        echo -e "${YELLOW}⚠️  python3 not found; skipping venv creation.${NC}"
+        return 0
+    fi
+
+    if python3 -m venv "$dir/.venv"; then
+        echo -e "${GREEN}✓ Created virtual environment: ${dir}/.venv${NC}"
+    else
+        echo -e "${YELLOW}⚠️  Failed to create venv at ${dir}/.venv${NC}"
+    fi
+}
+
+sandbox_write_rag_templates() {
+    local dir="$1"
+    mkdir -p "$dir/documents"
+
+    cat <<'EOF' > "$dir/config.py"
+# config.py
+from dataclasses import dataclass
+from pathlib import Path
+
+# Default values chosen to be sensible for a local sandbox.
+BASE_DIR = Path(__file__).resolve().parent
+DOCUMENTS_DIR = BASE_DIR / "documents"
+INDEX_PATH = BASE_DIR / "index.json"
+TOP_K = 3
+
+@dataclass(frozen=True)
+class RagConfig:
+    documents_dir: Path = DOCUMENTS_DIR
+    index_path: Path = INDEX_PATH
+    top_k: int = TOP_K
+EOF
+
+    cat <<'EOF' > "$dir/rag_sandbox.py"
+# rag_sandbox.py
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Tuple
+
+import config
+
+
+TOKEN_RE = re.compile(r"[A-Za-z0-9']+")
+
+
+@dataclass
+class DocumentVector:
+    path: str
+    term_freq: Dict[str, int]
+    norm: float
+
+
+def tokenize(text: str) -> List[str]:
+    return [match.group(0).lower() for match in TOKEN_RE.finditer(text)]
+
+
+def load_documents(documents_dir: Path) -> Dict[str, str]:
+    documents: Dict[str, str] = {}
+    for path in sorted(documents_dir.glob("*.txt")) + sorted(documents_dir.glob("*.md")):
+        try:
+            documents[str(path)] = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"Blimey, couldn't read {path}: {exc}")
+    return documents
+
+
+def build_vectors(documents: Dict[str, str]) -> List[DocumentVector]:
+    vectors: List[DocumentVector] = []
+    for path, content in documents.items():
+        terms = Counter(tokenize(content))
+        norm = math.sqrt(sum(freq * freq for freq in terms.values()))
+        vectors.append(DocumentVector(path=path, term_freq=dict(terms), norm=norm))
+    return vectors
+
+
+def save_index(vectors: Iterable[DocumentVector], index_path: Path) -> None:
+    payload = {
+        "documents": [
+            {"path": vector.path, "term_freq": vector.term_freq, "norm": vector.norm}
+            for vector in vectors
+        ]
+    }
+    index_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def load_index(index_path: Path) -> List[DocumentVector]:
+    try:
+        data = json.loads(index_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise RuntimeError(f"Index file missing or unreadable: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Index file is not valid JSON: {exc}") from exc
+
+    vectors: List[DocumentVector] = []
+    for item in data.get("documents", []):
+        vectors.append(
+            DocumentVector(
+                path=item.get("path", "unknown"),
+                term_freq=item.get("term_freq", {}),
+                norm=float(item.get("norm", 0.0)),
+            )
+        )
+    return vectors
+
+
+def cosine_similarity(query_vec: Counter, doc_vec: DocumentVector) -> float:
+    if doc_vec.norm == 0:
+        return 0.0
+    dot = sum(query_vec.get(term, 0) * freq for term, freq in doc_vec.term_freq.items())
+    query_norm = math.sqrt(sum(freq * freq for freq in query_vec.values()))
+    if query_norm == 0:
+        return 0.0
+    return dot / (query_norm * doc_vec.norm)
+
+
+def query_index(query: str, vectors: List[DocumentVector], top_k: int) -> List[Tuple[float, DocumentVector]]:
+    query_vec = Counter(tokenize(query))
+    scored = [(cosine_similarity(query_vec, vec), vec) for vec in vectors]
+    return sorted(scored, key=lambda item: item[0], reverse=True)[:top_k]
+
+
+def handle_index(cfg: config.RagConfig) -> None:
+    cfg.documents_dir.mkdir(parents=True, exist_ok=True)
+    documents = load_documents(cfg.documents_dir)
+    if not documents:
+        print("No documents found. Pop a few .txt or .md files into documents/ first.")
+        return
+    vectors = build_vectors(documents)
+    save_index(vectors, cfg.index_path)
+    print(f"Sorted. Indexed {len(vectors)} document(s) into {cfg.index_path}.")
+
+
+def handle_query(cfg: config.RagConfig, query: str) -> None:
+    vectors = load_index(cfg.index_path)
+    results = query_index(query, vectors, cfg.top_k)
+    print(f"Top {cfg.top_k} results for '{query}':")
+    for score, vec in results:
+        label = Path(vec.path).name
+        print(f"  • {label} (score {score:.3f})")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Lightweight RAG sandbox (no external deps).")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("index", help="Build or refresh the vector index.")
+
+    query_parser = subparsers.add_parser("query", help="Query the vector index.")
+    query_parser.add_argument("text", help="Search text for retrieval.")
+    return parser
+
+
+def main() -> None:
+    cfg = config.RagConfig()
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command == "index":
+        handle_index(cfg)
+    elif args.command == "query":
+        handle_query(cfg, args.text)
+
+
+if __name__ == "__main__":
+    main()
+EOF
+
+    cat <<'EOF' > "$dir/documents/sample.txt"
+This is a tiny sandbox document about Cody.
+It mentions RAG, MCP, cron jobs, and virtual environments for testing.
+EOF
+}
+
+sandbox_write_mcp_templates() {
+    local dir="$1"
+
+    cat <<'EOF' > "$dir/config.py"
+# config.py
+from dataclasses import dataclass
+from pathlib import Path
+
+# Default values chosen for a self-contained MCP sandbox.
+BASE_DIR = Path(__file__).resolve().parent
+LOG_PATH = BASE_DIR / "mcp_sandbox.log"
+
+@dataclass(frozen=True)
+class McpConfig:
+    log_path: Path = LOG_PATH
+EOF
+
+    cat <<'EOF' > "$dir/mcp_sandbox.py"
+# mcp_sandbox.py
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime
+from typing import Any, Dict
+
+import config
+
+
+TOOLS = {
+    "echo": {
+        "description": "Echo the payload back to the caller.",
+        "handler": lambda params: {"echo": params},
+    },
+    "time": {
+        "description": "Return the current UTC time.",
+        "handler": lambda params: {"utc": datetime.utcnow().isoformat() + "Z"},
+    },
+}
+
+RESOURCES = [
+    {"uri": "sandbox://status", "name": "Sandbox status", "mime": "application/json"},
+]
+
+
+def log_line(message: str) -> None:
+    timestamp = datetime.utcnow().isoformat()
+    log_path = config.McpConfig().log_path
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"[{timestamp}] {message}\n")
+
+
+def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
+    method = request.get("method", "")
+    request_id = request.get("id")
+
+    if method == "mcp.list_tools":
+        result = [{"name": name, "description": tool["description"]} for name, tool in TOOLS.items()]
+        return {"id": request_id, "result": result}
+    if method == "mcp.list_resources":
+        return {"id": request_id, "result": RESOURCES}
+    if method == "mcp.call_tool":
+        tool_name = request.get("params", {}).get("name")
+        tool = TOOLS.get(tool_name)
+        if not tool:
+            return {"id": request_id, "error": f"Unknown tool: {tool_name}"}
+        payload = request.get("params", {}).get("payload", {})
+        return {"id": request_id, "result": tool["handler"](payload)}
+
+    return {"id": request_id, "error": f"Unknown method: {method}"}
+
+
+def serve_stdio() -> None:
+    print("MCP sandbox ready. Send JSON-RPC lines; Ctrl+D to stop.")
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError as exc:
+            response = {"id": None, "error": f"Invalid JSON: {exc}"}
+        else:
+            response = handle_request(request)
+        print(json.dumps(response), flush=True)
+        log_line(f"Handled: {line}")
+
+
+def call_tool(tool_name: str, payload: Dict[str, Any]) -> None:
+    request = {"id": "local", "method": "mcp.call_tool", "params": {"name": tool_name, "payload": payload}}
+    response = handle_request(request)
+    print(json.dumps(response, indent=2))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Minimal MCP sandbox over stdin/stdout.")
+    parser.add_argument("--serve", action="store_true", help="Run the MCP sandbox server.")
+    parser.add_argument("--call", metavar="TOOL", help="Call a tool locally (e.g., echo, time).")
+    parser.add_argument("--payload", default="{}", help="JSON payload for --call.")
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.serve:
+        serve_stdio()
+        return
+
+    if args.call:
+        try:
+            payload = json.loads(args.payload)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"Payload must be valid JSON: {exc}") from exc
+        call_tool(args.call, payload)
+        return
+
+    parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
+EOF
+}
+
+sandbox_write_cron_templates() {
+    local dir="$1"
+
+    cat <<'EOF' > "$dir/config.py"
+# config.py
+from dataclasses import dataclass
+from pathlib import Path
+
+# Default values chosen for a local cron sandbox.
+BASE_DIR = Path(__file__).resolve().parent
+CRON_FILE = BASE_DIR / "cron_jobs.json"
+LOG_PATH = BASE_DIR / "cron_sandbox.log"
+
+@dataclass(frozen=True)
+class CronConfig:
+    cron_file: Path = CRON_FILE
+    log_path: Path = LOG_PATH
+EOF
+
+    cat <<'EOF' > "$dir/cron_sandbox.py"
+# cron_sandbox.py
+from __future__ import annotations
+
+import argparse
+import json
+import shlex
+import subprocess
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Iterable, List, Set
+
+import config
+
+
+@dataclass(frozen=True)
+class CronJob:
+    schedule: str
+    command: str
+    description: str
+
+
+def parse_field(field: str, minimum: int, maximum: int) -> Set[int]:
+    values: Set[int] = set()
+    for part in field.split(","):
+        part = part.strip()
+        if part == "*":
+            values.update(range(minimum, maximum + 1))
+        elif part.startswith("*/"):
+            step = int(part[2:])
+            values.update(range(minimum, maximum + 1, step))
+        else:
+            values.add(int(part))
+    return {value for value in values if minimum <= value <= maximum}
+
+
+def parse_schedule(schedule: str) -> Dict[str, Set[int]]:
+    fields = schedule.split()
+    if len(fields) != 5:
+        raise ValueError("Cron schedule must have 5 fields (min hour day month weekday).")
+    return {
+        "minute": parse_field(fields[0], 0, 59),
+        "hour": parse_field(fields[1], 0, 23),
+        "day": parse_field(fields[2], 1, 31),
+        "month": parse_field(fields[3], 1, 12),
+        "weekday": parse_field(fields[4], 0, 6),
+    }
+
+
+def load_jobs(cron_file: Path) -> List[CronJob]:
+    data = json.loads(cron_file.read_text(encoding="utf-8"))
+    jobs = []
+    for entry in data.get("jobs", []):
+        jobs.append(
+            CronJob(
+                schedule=entry["schedule"],
+                command=entry["command"],
+                description=entry.get("description", "No description"),
+            )
+        )
+    return jobs
+
+
+def log_line(message: str, log_path: Path) -> None:
+    timestamp = datetime.utcnow().isoformat()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"[{timestamp}] {message}\n")
+
+
+def should_run(now: datetime, schedule: Dict[str, Set[int]]) -> bool:
+    return (
+        now.minute in schedule["minute"]
+        and now.hour in schedule["hour"]
+        and now.day in schedule["day"]
+        and now.month in schedule["month"]
+        and now.weekday() in schedule["weekday"]
+    )
+
+
+def run_loop(cfg: config.CronConfig) -> None:
+    last_run: Dict[str, str] = {}
+    print("Cron sandbox running. Keeping it tidy and on schedule.")
+    while True:
+        now = datetime.now()
+        stamp = now.strftime("%Y-%m-%d %H:%M")
+        try:
+            jobs = load_jobs(cfg.cron_file)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Can't read cron jobs: {exc}")
+            time.sleep(30)
+            continue
+
+        for job in jobs:
+            schedule = parse_schedule(job.schedule)
+            key = f"{job.command}-{job.schedule}"
+            if should_run(now, schedule) and last_run.get(key) != stamp:
+                last_run[key] = stamp
+                print(f"Running: {job.description}")
+                try:
+                    subprocess.run(shlex.split(job.command), check=False)
+                    log_line(f"Ran: {job.command}", cfg.log_path)
+                except OSError as exc:
+                    log_line(f"Failed: {job.command} ({exc})", cfg.log_path)
+        time.sleep(30)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Local cron sandbox runner.")
+    parser.add_argument("--run", action="store_true", help="Run the cron loop.")
+    return parser
+
+
+def main() -> None:
+    cfg = config.CronConfig()
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.run:
+        run_loop(cfg)
+        return
+    parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
+EOF
+
+    cat <<'EOF' > "$dir/cron_jobs.json"
+{
+  "jobs": [
+    {
+      "schedule": "*/5 * * * *",
+      "command": "python3 -c \"print('Tally ho from the cron sandbox.')\"",
+      "description": "Sample heartbeat job (every 5 minutes)."
+    }
+  ]
+}
+EOF
+}
+
+sandbox_write_venv_templates() {
+    local dir="$1"
+
+    cat <<'EOF' > "$dir/config.py"
+# config.py
+from dataclasses import dataclass
+from pathlib import Path
+
+# Default values chosen for a lightweight venv sandbox.
+BASE_DIR = Path(__file__).resolve().parent
+
+@dataclass(frozen=True)
+class VenvConfig:
+    base_dir: Path = BASE_DIR
+EOF
+
+    cat <<'EOF' > "$dir/main.py"
+# main.py
+from __future__ import annotations
+
+from datetime import datetime
+
+import config
+
+
+def main() -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    print(f"Right then, virtual env sandbox ready at {config.VenvConfig().base_dir}. Time: {now}")
+
+
+if __name__ == "__main__":
+    main()
+EOF
+
+    cat <<'EOF' > "$dir/requirements.txt"
+# requirements.txt
+# Add project dependencies here.
+EOF
+}
+
+sandbox_create() {
+    local sandbox_type="$1"
+    local name="$2"
+    shift 2 || true
+    local auto_venv="$SANDBOX_AUTO_VENV"
+
+    for arg in "$@"; do
+        case "$arg" in
+            --no-venv) auto_venv=0 ;;
+            --venv) auto_venv=1 ;;
+        esac
+    done
+
+    if [ -z "$sandbox_type" ] || [ -z "$name" ]; then
+        echo -e "${YELLOW}Usage: /sandbox create <rag|mcp|cron|venv> <name> [--no-venv]${NC}"
+        return 1
+    fi
+
+    if ! is_valid_sandbox_name "$name"; then
+        echo -e "${RED}✗ Invalid sandbox name. Use letters, numbers, '.', '-' or '_' only.${NC}"
+        return 1
+    fi
+
+    ensure_sandbox_root
+    local dir
+    dir=$(sandbox_dir_for "$name")
+    if [ -d "$dir" ]; then
+        echo -e "${YELLOW}Sandbox already exists: $name${NC}"
+        return 1
+    fi
+
+    mkdir -p "$dir"
+    case "$sandbox_type" in
+        rag)
+            sandbox_write_rag_templates "$dir"
+            ;;
+        mcp)
+            sandbox_write_mcp_templates "$dir"
+            ;;
+        cron)
+            sandbox_write_cron_templates "$dir"
+            ;;
+        venv)
+            sandbox_write_venv_templates "$dir"
+            auto_venv=1
+            ;;
+        *)
+            echo -e "${YELLOW}Unknown sandbox type: $sandbox_type${NC}"
+            rm -rf "$dir"
+            return 1
+            ;;
+    esac
+
+    maybe_create_venv "$dir" "$auto_venv"
+    echo -e "${GREEN}✓ Created ${sandbox_type} sandbox: $name${NC}"
+    echo -e "${GRAY}Path: $dir${NC}"
+}
+
+sandbox_list() {
+    ensure_sandbox_root
+    shopt -s nullglob
+    local entries=("$SANDBOX_ROOT"/*)
+    shopt -u nullglob
+    if [ ${#entries[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No sandboxes found yet.${NC}"
+        return 0
+    fi
+
+    echo -e "${BLUE}🧪 Sandboxes:${NC}"
+    for entry in "${entries[@]}"; do
+        [ -d "$entry" ] || continue
+        echo -e "  ${WHITE}$(basename "$entry")${NC} ${GRAY}(${entry})${NC}"
+    done
+}
+
+sandbox_use() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo -e "${YELLOW}Usage: /sandbox use <name>${NC}"
+        return 1
+    fi
+
+    local dir
+    dir=$(sandbox_dir_for "$name")
+    if [ ! -d "$dir" ]; then
+        echo -e "${RED}✗ Sandbox not found: $name${NC}"
+        return 1
+    fi
+
+    WORK_DIR="$dir"
+    cd "$WORK_DIR" || return 1
+    echo -e "${GREEN}✓ Using sandbox: $name${NC}"
+}
+
+sandbox_info() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo -e "${YELLOW}Usage: /sandbox info <name>${NC}"
+        return 1
+    fi
+
+    local dir
+    dir=$(sandbox_dir_for "$name")
+    if [ ! -d "$dir" ]; then
+        echo -e "${RED}✗ Sandbox not found: $name${NC}"
+        return 1
+    fi
+
+    echo -e "${BLUE}🧪 Sandbox: ${name}${NC}"
+    echo -e "  ${CYAN}Path:${NC} $dir"
+    if [ -d "$dir/.venv" ]; then
+        echo -e "  ${CYAN}Venv:${NC} $dir/.venv"
+    fi
+}
+
+sandbox_delete() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo -e "${YELLOW}Usage: /sandbox delete <name>${NC}"
+        return 1
+    fi
+
+    local dir
+    dir=$(sandbox_dir_for "$name")
+    if [ ! -d "$dir" ]; then
+        echo -e "${RED}✗ Sandbox not found: $name${NC}"
+        return 1
+    fi
+
+    echo -e -n "${YELLOW}Delete sandbox '${name}'? (y/N): ${NC}"
+    local confirm
+    read -r confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${GRAY}Cancelled${NC}"
+        return 1
+    fi
+
+    rm -rf "$dir"
+    echo -e "${GREEN}✓ Deleted sandbox: $name${NC}"
 }
 
 # Session profile helpers
@@ -1076,6 +1751,7 @@ print_header() {
     echo -e "  ${BLUE}/doctor${NC}                           ${GRAY}Run diagnostics${NC}"
     echo -e "  ${BLUE}/profile${NC}                          ${GRAY}Manage session profiles${NC}"
     echo -e "  ${BLUE}/agent${NC}                            ${GRAY}Manage and spawn agents${NC}"
+    echo -e "  ${BLUE}/sandbox${NC}                          ${GRAY}Manage RAG/MCP/venv/cron sandboxes${NC}"
     echo -e "  ${BLUE}/wizard${NC}                           ${GRAY}Run onboarding wizard${NC}"
     echo -e "  ${BLUE}/model${NC} | ${BLUE}/provider${NC} | ${BLUE}/clear${NC} | ${BLUE}/help${NC} | ${BLUE}/exit${NC}"
     echo -e "${GRAY}Tip: Press Tab for contextual suggestions. Use /help <query> to search.${NC}"
@@ -1127,6 +1803,7 @@ print_help() {
         "Execution & Tools"
         "AI Assistance"
         "Agents"
+        "Sandboxing"
         "Configuration & Profiles"
         "Navigation"
     )
@@ -1158,6 +1835,13 @@ print_help() {
         "/agent logs <name> - Tail agent logs"
         "/agent delete <name> - Delete an agent"
     )
+    local -a items_sandbox=(
+        "/sandbox list - List sandboxes"
+        "/sandbox create <rag|mcp|cron|venv> <name> [--no-venv] - Create a sandbox"
+        "/sandbox use <name> - Use a sandbox as the working directory"
+        "/sandbox info <name> - Show sandbox details"
+        "/sandbox delete <name> - Delete a sandbox"
+    )
     local -a items_config=(
         "/model - Select model"
         "/provider - Select OpenRouter provider"
@@ -1181,6 +1865,7 @@ print_help() {
             "${items_execution[@]}" \
             "${items_ai[@]}" \
             "${items_agents[@]}" \
+            "${items_sandbox[@]}" \
             "${items_config[@]}" \
             "${items_nav[@]}" | grep -i "$query" | while IFS= read -r line; do
                 echo -e "  ${WHITE}${line}${NC}"
@@ -1197,8 +1882,10 @@ print_help() {
     echo -e "${CYAN}${sections[3]}${NC}"
     for line in "${items_agents[@]}"; do echo -e "  ${WHITE}${line}${NC}"; done
     echo -e "${CYAN}${sections[4]}${NC}"
-    for line in "${items_config[@]}"; do echo -e "  ${WHITE}${line}${NC}"; done
+    for line in "${items_sandbox[@]}"; do echo -e "  ${WHITE}${line}${NC}"; done
     echo -e "${CYAN}${sections[5]}${NC}"
+    for line in "${items_config[@]}"; do echo -e "  ${WHITE}${line}${NC}"; done
+    echo -e "${CYAN}${sections[6]}${NC}"
     for line in "${items_nav[@]}"; do echo -e "  ${WHITE}${line}${NC}"; done
 }
 
@@ -2014,6 +2701,31 @@ handle_agent() {
     esac
 }
 
+handle_sandbox() {
+    local action="$1"
+    shift || true
+    case "$action" in
+        list|"")
+            sandbox_list
+            ;;
+        create)
+            sandbox_create "$@"
+            ;;
+        use)
+            sandbox_use "$1"
+            ;;
+        info)
+            sandbox_info "$1"
+            ;;
+        delete)
+            sandbox_delete "$1"
+            ;;
+        *)
+            echo -e "${YELLOW}Usage: /sandbox list|create|use|info|delete${NC}"
+            ;;
+    esac
+}
+
 # MAIN INPUT PARSER
 parse_input() {
     local input="$1"
@@ -2060,6 +2772,7 @@ parse_input() {
                 ;;
             "profile") handle_profile $args ;;
             "agent") handle_agent $args ;;
+            "sandbox") handle_sandbox $args ;;
             "wizard") run_onboarding_wizard ;;
             "clear")
                 > "$MEMORY_FILE"
