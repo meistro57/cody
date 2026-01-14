@@ -58,7 +58,7 @@ TARGET="🎯"
 DEFAULT_COMMANDS=(
     "/create" "/edit" "/run" "/explain" "/fix" "/files" "/exec"
     "/pip" "/npm" "/pnpm" "/yarn" "/selfmod" "/reload" "/status"
-    "/model" "/provider" "/clear" "/help" "/profile" "/wizard" "/exit"
+    "/doctor" "/model" "/provider" "/clear" "/help" "/profile" "/wizard" "/exit"
 )
 
 FILE_COMMANDS=("/create" "/edit" "/run" "/explain" "/fix")
@@ -761,6 +761,7 @@ print_header() {
     echo -e "  ${BLUE}/selfmod${NC} <description>            ${GRAY}Modify myself${NC}"
     echo -e "  ${BLUE}/reload${NC}                           ${GRAY}Reload system prompt${NC}"
     echo -e "  ${BLUE}/status${NC}                           ${GRAY}Show endpoint status${NC}"
+    echo -e "  ${BLUE}/doctor${NC}                           ${GRAY}Run diagnostics${NC}"
     echo -e "  ${BLUE}/profile${NC}                          ${GRAY}Manage session profiles${NC}"
     echo -e "  ${BLUE}/wizard${NC}                           ${GRAY}Run onboarding wizard${NC}"
     echo -e "  ${BLUE}/model${NC} | ${BLUE}/provider${NC} | ${BLUE}/clear${NC} | ${BLUE}/help${NC} | ${BLUE}/exit${NC}"
@@ -838,6 +839,7 @@ print_help() {
         "/model - Select model"
         "/provider - Select OpenRouter provider"
         "/status - Show endpoint status"
+        "/doctor - Run diagnostics"
         "/reload - Reload system prompt"
         "/profile list|use|save|delete|show - Manage session profiles"
         "/wizard - Run onboarding wizard"
@@ -1518,6 +1520,89 @@ handle_status() {
     fi
 }
 
+handle_doctor() {
+    echo -e "${BLUE}🩺 Diagnostics${NC}"
+
+    local issues=0
+    local warnings=0
+    local missing=()
+
+    command -v curl > /dev/null || missing+=("curl")
+    command -v jq > /dev/null || missing+=("jq")
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo -e "${RED}✗ Missing dependencies: ${missing[*]}${NC}"
+        issues=$((issues + 1))
+    else
+        echo -e "${GREEN}✓ Dependencies available (curl, jq)${NC}"
+    fi
+
+    if [ -d "$WORK_DIR" ]; then
+        echo -e "${GREEN}✓ Working directory: $WORK_DIR${NC}"
+    else
+        echo -e "${RED}✗ WORK_DIR not found: $WORK_DIR${NC}"
+        issues=$((issues + 1))
+    fi
+
+    if [ -f "$WORK_DIR/.env" ]; then
+        echo -e "${GREEN}✓ Project .env detected${NC}"
+    elif [ -f "$HOME/.cody_env" ]; then
+        echo -e "${GREEN}✓ User .cody_env detected${NC}"
+    else
+        echo -e "${YELLOW}⚠️  No .env or ~/.cody_env found${NC}"
+        warnings=$((warnings + 1))
+    fi
+
+    if [ "$API_PROVIDER" = "openrouter" ]; then
+        if [ -n "$OPENROUTER_API_KEY" ]; then
+            echo -e "${GREEN}✓ OpenRouter API key configured${NC}"
+        else
+            echo -e "${RED}✗ OPENROUTER_API_KEY not set${NC}"
+            issues=$((issues + 1))
+        fi
+        local provider_label="${PROVIDER_NAME:-auto}"
+        echo -e "${CYAN}Provider:${NC} ${provider_label}"
+    fi
+
+    if test_endpoint "$GEMMA_ENDPOINT" "$API_PROVIDER"; then
+        echo -e "${GREEN}✓ Endpoint reachable: $GEMMA_ENDPOINT${NC}"
+    else
+        echo -e "${RED}✗ Endpoint unreachable: $GEMMA_ENDPOINT${NC}"
+        issues=$((issues + 1))
+    fi
+
+    if [ -n "$MEMORY_FILE" ]; then
+        local memory_dir
+        memory_dir=$(dirname "$MEMORY_FILE")
+        if [ -e "$MEMORY_FILE" ]; then
+            if [ -w "$MEMORY_FILE" ]; then
+                echo -e "${GREEN}✓ Memory file writable: $MEMORY_FILE${NC}"
+            else
+                echo -e "${RED}✗ Memory file not writable: $MEMORY_FILE${NC}"
+                issues=$((issues + 1))
+            fi
+        elif [ -d "$memory_dir" ] && [ -w "$memory_dir" ]; then
+            echo -e "${GREEN}✓ Memory file directory writable: $memory_dir${NC}"
+        else
+            echo -e "${RED}✗ Memory file directory not writable: $memory_dir${NC}"
+            issues=$((issues + 1))
+        fi
+    fi
+
+    if [ "$issues" -eq 0 ] && [ "$warnings" -eq 0 ]; then
+        echo -e "${GREEN}✓ Diagnostics passed${NC}"
+        return 0
+    fi
+
+    if [ "$issues" -eq 0 ]; then
+        echo -e "${YELLOW}⚠️  Diagnostics completed with ${warnings} warning(s)${NC}"
+        return 0
+    fi
+
+    echo -e "${RED}✗ Diagnostics found ${issues} issue(s)${NC}"
+    return 1
+}
+
 handle_chat() {
     local input="$1"
     
@@ -1605,6 +1690,7 @@ parse_input() {
             "model") select_model ;;
             "provider") select_provider ;;
             "status") handle_status ;;
+            "doctor") handle_doctor ;;
             "reload")
                 load_system_prompt
                 echo -e "${GREEN}✓ System prompt reloaded${NC}"
