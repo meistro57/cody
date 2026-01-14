@@ -3,9 +3,9 @@
 ```
 ██████╗  ██████╗ ██████╗ ██╗   ██╗
 ██╔════╝██╔═══██╗██╔══██╗╚██╗ ██╔╝
-██║     ██║   ██║██║  ██║ ╚████╔╝ 
-██║     ██║   ██║██║  ██║  ╚██╔╝  
-╚██████╗╚██████╔╝██████╔╝   ██║   
+██║     ██║   ██║██║  ██║ ╚████╔╝
+██║     ██║   ██║██║  ██║  ╚██╔╝
+╚██████╗╚██████╔╝██████╔╝   ██║
  ╚═════╝ ╚═════╝ ╚═════╝    ╚═╝
 ```
 
@@ -17,6 +17,31 @@ Cody is a command-line AI assistant that can create, edit, run, explain, and fix
 ---
 
 <img width="1110" height="626" alt="image" src="https://github.com/user-attachments/assets/c7c00380-f11d-4735-a43e-24bc849f2a01" />
+
+## At a Glance
+
+- **Purpose**: An AI-powered command-line co-pilot with safe automation features.
+- **Target users**: Developers who want fast local AI workflows.
+- **Core strengths**: Self-modification, natural-language commands, and lightweight setup.
+
+---
+
+## Table of Contents
+
+- [Features](#features)
+- [Quick Start](#quick-start)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Usage](#usage)
+- [Safety](#safety)
+- [Project Layout](#project-layout)
+- [Troubleshooting](#troubleshooting)
+- [Project Docs](#project-docs)
+- [Extending](#extending)
+- [License](#license)
+
+---
 
 ## Features
 
@@ -34,22 +59,38 @@ Cody is a command-line AI assistant that can create, edit, run, explain, and fix
 ## Quick Start
 
 1. **Clone or copy Cody to your project directory.**
-
-2. **Copy and edit the environment file:**
+2. **Create a configuration file:**
    ```bash
    cp env.example .env
    # Edit .env to set your endpoints and preferences
    ```
-
 3. **Install dependencies:**
    - Bash (v4+ recommended)
    - `curl`
    - `jq`
-
 4. **Run Cody:**
    ```bash
    ./cody
    ```
+
+---
+
+## Prerequisites
+
+- A local LLM endpoint (LM Studio, Ollama, or compatible).
+- Bash 4+ (macOS users may need to install a newer Bash).
+- `curl` and `jq` available in `PATH`.
+
+---
+
+## Installation
+
+```bash
+chmod +x cody
+./cody
+```
+
+If you are running from a new repo, keep `cody`, `cody_system.txt`, and your `.env` together in the project root so context injection works reliably.
 
 ---
 
@@ -66,6 +107,10 @@ MEMORY_FILE="$HOME/.cody_global_memory"
 HISTORY_FILE="$HOME/.cody_history"
 MAX_BACKUPS=5
 ```
+
+Recommended options:
+- Keep `MEMORY_FILE` and `HISTORY_FILE` in your home directory for portability.
+- Set `MAX_BACKUPS` to match your storage and rollback comfort level.
 
 You can override any of these variables in your `.env`.
 
@@ -97,16 +142,6 @@ You can also type natural language requests:
 
 ---
 
-## Interface Highlights
-
-- **Welcome Banner**: ASCII art logo and tagline on startup.
-- **Colorful Prompts**: Distinct colors for prompts, responses, and sections.
-- **Status Bar**: Model, endpoint, and working directory shown in the header.
-- **Animated Typing**: "Thinking..." animation with dots.
-- **Command Hints**: `/help` shows all available commands.
-
----
-
 ## Safety
 
 - Dangerous shell commands are blocked by default.
@@ -114,6 +149,27 @@ You can also type natural language requests:
 - Cody will prompt before executing most actions.
 
 See [DISCLAIMER.md](DISCLAIMER.md) for the full safety notice.
+
+---
+
+## Project Layout
+
+- `cody` — Main executable Bash script.
+- `cody_system.txt` — System prompt that defines Cody’s behaviour.
+- `env.example` — Configuration template.
+- `README.md` — Primary documentation.
+- `CLAUDE.md` — Architecture notes and development guidance.
+- `ENHANCEMENTS.md` — Suggested features and roadmap ideas.
+- `DISCLAIMER.md` — Safety and liability notice.
+
+---
+
+## Troubleshooting
+
+- **No models available**: check `curl -s "$GEMMA_ENDPOINT/v1/models"` or `curl -s "$OLLAMA_ENDPOINT/api/tags"`.
+- **Command blocked**: Cody blocks dangerous patterns by default; try a safer alternative.
+- **Missing dependencies**: run `command -v curl && command -v jq`.
+- **Configuration not loading**: verify `.env` exists and uses valid shell syntax.
 
 ---
 

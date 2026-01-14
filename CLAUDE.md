@@ -123,6 +123,12 @@ The `execute_command()` function blocks dangerous patterns:
 - Network operations (`curl http`, `wget http`)
 - System commands (`shutdown`, `reboot`, `halt`)
 
+## Documentation Workflow
+
+- Keep `README.md`, `DISCLAIMER.md`, and `ENHANCEMENTS.md` in sync when features change.
+- Add new commands to both the `/help` output and the README usage list.
+- Update troubleshooting notes when adding new dependencies or endpoints.
+
 ## Configuration Files
 
 ### Environment Configuration
