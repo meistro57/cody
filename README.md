@@ -121,6 +121,7 @@ See [DISCLAIMER.md](DISCLAIMER.md) for the full safety notice.
 
 - [CLAUDE.md](CLAUDE.md) – Architecture notes and development guidance.
 - [DISCLAIMER.md](DISCLAIMER.md) – Safety and liability notice.
+- [ENHANCEMENTS.md](ENHANCEMENTS.md) – Suggested enhancements and additional features.
 
 ---
 
