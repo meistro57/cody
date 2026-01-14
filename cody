@@ -37,6 +37,7 @@ CODY_PROFILES_FILE="${CODY_PROFILES_FILE:-$HOME/.cody_profiles}"
 PROFILE_NAME=""
 ONBOARDING_FLAG="${ONBOARDING_FLAG:-$HOME/.cody_onboarded}"
 DEFAULT_PROFILE_MEMORY_DIR="${DEFAULT_PROFILE_MEMORY_DIR:-$HOME}"
+AGENTS_DIR="${AGENTS_DIR:-$HOME/.cody_agents}"
 
 # Colors
 RED='\033[0;31m'
@@ -58,14 +59,17 @@ TARGET="🎯"
 DEFAULT_COMMANDS=(
     "/create" "/edit" "/run" "/explain" "/fix" "/files" "/exec"
     "/pip" "/npm" "/pnpm" "/yarn" "/selfmod" "/reload" "/status"
-    "/doctor" "/model" "/provider" "/clear" "/help" "/profile" "/wizard" "/exit"
+    "/doctor" "/model" "/provider" "/clear" "/help" "/profile" "/agent" "/wizard" "/exit"
 )
 
 FILE_COMMANDS=("/create" "/edit" "/run" "/explain" "/fix")
 
 # Load system prompt from file
 load_system_prompt() {
-    if [ -f "$WORK_DIR/cody_system.txt" ]; then
+    if [ -n "$CODY_SYSTEM_PROMPT" ]; then
+        SYSTEM_PROMPT="$CODY_SYSTEM_PROMPT"
+        echo -e "${GREEN}✓ Loaded system prompt: CODY_SYSTEM_PROMPT${NC}"
+    elif [ -f "$WORK_DIR/cody_system.txt" ]; then
         SYSTEM_PROMPT=$(cat "$WORK_DIR/cody_system.txt")
         echo -e "${GREEN}✓ Loaded system prompt: cody_system.txt${NC}"
     elif [ -f "$HOME/.cody_system_prompt" ]; then
@@ -75,6 +79,314 @@ load_system_prompt() {
         SYSTEM_PROMPT="You are Cody, a self-modifying AI development assistant created by Mark Hubrich. You execute actions decisively instead of just suggesting them. When asked to do something, you DO it immediately. Be confident and action-oriented."
         echo -e "${YELLOW}⚠️ Using default system prompt${NC}"
     fi
+}
+
+# Agent helpers
+ensure_agents_dir() {
+    mkdir -p "$AGENTS_DIR"
+}
+
+is_valid_agent_name() {
+    local name="$1"
+    [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]]
+}
+
+agent_dir_for() {
+    local name="$1"
+    echo "$AGENTS_DIR/$name"
+}
+
+load_agent_config() {
+    local name="$1"
+    local agent_dir
+    agent_dir=$(agent_dir_for "$name")
+    local config_file="$agent_dir/agent.conf"
+    local prompt_file="$agent_dir/system_prompt.txt"
+
+    if [ ! -d "$agent_dir" ] || [ ! -f "$config_file" ]; then
+        echo -e "${RED}✗ Agent not found: $name${NC}"
+        return 1
+    fi
+
+    AGENT_NAME="$name"
+    AGENT_WORK_DIR=""
+    AGENT_MODEL_NAME=""
+    AGENT_API_PROVIDER=""
+    AGENT_PROVIDER_NAME=""
+    AGENT_SYSTEM_PROMPT=""
+
+    while IFS='=' read -r key value; do
+        case "$key" in
+            WORK_DIR) AGENT_WORK_DIR="$value" ;;
+            MODEL_NAME) AGENT_MODEL_NAME="$value" ;;
+            API_PROVIDER) AGENT_API_PROVIDER="$value" ;;
+            PROVIDER_NAME) AGENT_PROVIDER_NAME="$value" ;;
+        esac
+    done < "$config_file"
+
+    if [ -f "$prompt_file" ]; then
+        AGENT_SYSTEM_PROMPT=$(cat "$prompt_file")
+    else
+        AGENT_SYSTEM_PROMPT="$SYSTEM_PROMPT"
+    fi
+
+    AGENT_WORK_DIR="${AGENT_WORK_DIR:-$WORK_DIR}"
+    AGENT_MODEL_NAME="${AGENT_MODEL_NAME:-$MODEL_NAME}"
+    AGENT_API_PROVIDER="${AGENT_API_PROVIDER:-$API_PROVIDER}"
+    AGENT_PROVIDER_NAME="${AGENT_PROVIDER_NAME:-$PROVIDER_NAME}"
+    AGENT_DIR="$agent_dir"
+}
+
+resolve_cody_bin() {
+    if [ -n "$CODY_BIN" ] && [ -x "$CODY_BIN" ]; then
+        echo "$CODY_BIN"
+        return 0
+    fi
+
+    local resolved=""
+    if command -v readlink > /dev/null 2>&1; then
+        resolved=$(readlink -f "$0" 2>/dev/null || true)
+    fi
+
+    if [ -n "$resolved" ]; then
+        echo "$resolved"
+        return 0
+    fi
+
+    local from_path
+    from_path=$(command -v cody 2>/dev/null || true)
+    if [ -n "$from_path" ]; then
+        echo "$from_path"
+        return 0
+    fi
+
+    echo "$0"
+}
+
+agent_create() {
+    local name="$1"
+    shift || true
+    local prompt="$*"
+
+    if [ -z "$name" ] || [ -z "$prompt" ]; then
+        echo -e "${YELLOW}Usage: /agent create <name> <system prompt>${NC}"
+        return 1
+    fi
+
+    if ! is_valid_agent_name "$name"; then
+        echo -e "${RED}✗ Invalid agent name. Use letters, numbers, '-' or '_' only.${NC}"
+        return 1
+    fi
+
+    ensure_agents_dir
+    local agent_dir
+    agent_dir=$(agent_dir_for "$name")
+    mkdir -p "$agent_dir"
+
+    printf "%s\n" "$prompt" > "$agent_dir/system_prompt.txt"
+    cat <<EOF > "$agent_dir/agent.conf"
+NAME=$name
+WORK_DIR=$WORK_DIR
+MODEL_NAME=$MODEL_NAME
+API_PROVIDER=$API_PROVIDER
+PROVIDER_NAME=$PROVIDER_NAME
+EOF
+
+    echo -e "${GREEN}✓ Agent created: $name${NC}"
+}
+
+agent_list() {
+    ensure_agents_dir
+    shopt -s nullglob
+    local entries=("$AGENTS_DIR"/*)
+    shopt -u nullglob
+    if [ ${#entries[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No agents found yet.${NC}"
+        return 0
+    fi
+
+    echo -e "${BLUE}🧩 Agents:${NC}"
+    for entry in "${entries[@]}"; do
+        [ -d "$entry" ] || continue
+        local name
+        name=$(basename "$entry")
+        local status="idle"
+        local pid_file="$entry/agent.pid"
+        if [ -f "$pid_file" ]; then
+            local pid
+            pid=$(cat "$pid_file")
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                status="running (pid $pid)"
+            else
+                status="stopped"
+            fi
+        fi
+        echo -e "  ${WHITE}${name}${NC} ${GRAY}(${status})${NC}"
+    done
+}
+
+agent_show() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo -e "${YELLOW}Usage: /agent show <name>${NC}"
+        return 1
+    fi
+
+    if ! load_agent_config "$name"; then
+        return 1
+    fi
+
+    echo -e "${BLUE}🧩 Agent: ${name}${NC}"
+    echo -e "  ${CYAN}Work dir:${NC} ${AGENT_WORK_DIR}"
+    echo -e "  ${CYAN}Model:${NC} ${AGENT_MODEL_NAME}"
+    echo -e "  ${CYAN}Provider:${NC} ${AGENT_API_PROVIDER}"
+    if [ -n "$AGENT_PROVIDER_NAME" ]; then
+        echo -e "  ${CYAN}OpenRouter Provider:${NC} ${AGENT_PROVIDER_NAME}"
+    fi
+    echo -e "  ${CYAN}System Prompt:${NC}"
+    echo "$AGENT_SYSTEM_PROMPT" | while IFS= read -r line; do
+        echo -e "    ${GRAY}${line}${NC}"
+    done
+}
+
+agent_delete() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo -e "${YELLOW}Usage: /agent delete <name>${NC}"
+        return 1
+    fi
+
+    local agent_dir
+    agent_dir=$(agent_dir_for "$name")
+    if [ ! -d "$agent_dir" ]; then
+        echo -e "${RED}✗ Agent not found: $name${NC}"
+        return 1
+    fi
+
+    rm -rf "$agent_dir"
+    echo -e "${GREEN}✓ Deleted agent: $name${NC}"
+}
+
+agent_spawn() {
+    local name="$1"
+    shift || true
+    local task="$*"
+
+    if [ -z "$name" ] || [ -z "$task" ]; then
+        echo -e "${YELLOW}Usage: /agent spawn <name> <task>${NC}"
+        return 1
+    fi
+
+    if ! load_agent_config "$name"; then
+        return 1
+    fi
+
+    local log_file="$AGENT_DIR/agent.log"
+    local pid_file="$AGENT_DIR/agent.pid"
+    local memory_file="$AGENT_DIR/memory.log"
+    local history_file="$AGENT_DIR/history.log"
+
+    local cody_bin
+    cody_bin=$(resolve_cody_bin)
+    if [ ! -x "$cody_bin" ]; then
+        echo -e "${RED}✗ Cody executable not found: $cody_bin${NC}"
+        return 1
+    fi
+
+    if command -v nohup > /dev/null 2>&1; then
+        nohup env \
+            CODY_SYSTEM_PROMPT="$AGENT_SYSTEM_PROMPT" \
+            WORK_DIR="$AGENT_WORK_DIR" \
+            MEMORY_FILE="$memory_file" \
+            HISTORY_FILE="$history_file" \
+            MODEL_NAME="$AGENT_MODEL_NAME" \
+            API_PROVIDER="$AGENT_API_PROVIDER" \
+            PROVIDER_NAME="$AGENT_PROVIDER_NAME" \
+            GEMMA_ENDPOINT="$GEMMA_ENDPOINT" \
+            OLLAMA_ENDPOINT="$OLLAMA_ENDPOINT" \
+            OPENROUTER_ENDPOINT="$OPENROUTER_ENDPOINT" \
+            OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
+            OPENROUTER_APP_NAME="$OPENROUTER_APP_NAME" \
+            OPENROUTER_HTTP_REFERER="$OPENROUTER_HTTP_REFERER" \
+            "$cody_bin" <<< "$task" > "$log_file" 2>&1 &
+    else
+        env \
+            CODY_SYSTEM_PROMPT="$AGENT_SYSTEM_PROMPT" \
+            WORK_DIR="$AGENT_WORK_DIR" \
+            MEMORY_FILE="$memory_file" \
+            HISTORY_FILE="$history_file" \
+            MODEL_NAME="$AGENT_MODEL_NAME" \
+            API_PROVIDER="$AGENT_API_PROVIDER" \
+            PROVIDER_NAME="$AGENT_PROVIDER_NAME" \
+            GEMMA_ENDPOINT="$GEMMA_ENDPOINT" \
+            OLLAMA_ENDPOINT="$OLLAMA_ENDPOINT" \
+            OPENROUTER_ENDPOINT="$OPENROUTER_ENDPOINT" \
+            OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
+            OPENROUTER_APP_NAME="$OPENROUTER_APP_NAME" \
+            OPENROUTER_HTTP_REFERER="$OPENROUTER_HTTP_REFERER" \
+            "$cody_bin" <<< "$task" > "$log_file" 2>&1 &
+    fi
+
+    local pid=$!
+    echo "$pid" > "$pid_file"
+    if command -v disown > /dev/null 2>&1; then
+        disown "$pid" 2>/dev/null || true
+    fi
+
+    echo -e "${GREEN}✓ Spawned agent '${name}' (pid ${pid})${NC}"
+    echo -e "${GRAY}Logs: ${log_file}${NC}"
+}
+
+agent_stop() {
+    local name="$1"
+    local mode="$2"
+    if [ -z "$name" ]; then
+        echo -e "${YELLOW}Usage: /agent stop <name> [--force]${NC}"
+        return 1
+    fi
+
+    local agent_dir
+    agent_dir=$(agent_dir_for "$name")
+    local pid_file="$agent_dir/agent.pid"
+    if [ ! -f "$pid_file" ]; then
+        echo -e "${RED}✗ No running agent recorded for: $name${NC}"
+        return 1
+    fi
+
+    local pid
+    pid=$(cat "$pid_file")
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        echo -e "${YELLOW}⚠️  Agent already stopped: $name${NC}"
+        return 0
+    fi
+
+    if [ "$mode" = "--force" ]; then
+        kill -9 "$pid" 2>/dev/null || true
+        echo -e "${GREEN}✓ Force-stopped agent '${name}' (pid ${pid})${NC}"
+        return 0
+    fi
+
+    kill "$pid" 2>/dev/null || true
+    echo -e "${GREEN}✓ Stopped agent '${name}' (pid ${pid})${NC}"
+}
+
+agent_logs() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo -e "${YELLOW}Usage: /agent logs <name>${NC}"
+        return 1
+    fi
+
+    local agent_dir
+    agent_dir=$(agent_dir_for "$name")
+    local log_file="$agent_dir/agent.log"
+    if [ ! -f "$log_file" ]; then
+        echo -e "${YELLOW}No log file found for agent: $name${NC}"
+        return 0
+    fi
+
+    echo -e "${BLUE}📜 Logs (${name})${NC}"
+    tail -n 50 "$log_file"
 }
 
 # Session profile helpers
@@ -763,6 +1075,7 @@ print_header() {
     echo -e "  ${BLUE}/status${NC}                           ${GRAY}Show endpoint status${NC}"
     echo -e "  ${BLUE}/doctor${NC}                           ${GRAY}Run diagnostics${NC}"
     echo -e "  ${BLUE}/profile${NC}                          ${GRAY}Manage session profiles${NC}"
+    echo -e "  ${BLUE}/agent${NC}                            ${GRAY}Manage and spawn agents${NC}"
     echo -e "  ${BLUE}/wizard${NC}                           ${GRAY}Run onboarding wizard${NC}"
     echo -e "  ${BLUE}/model${NC} | ${BLUE}/provider${NC} | ${BLUE}/clear${NC} | ${BLUE}/help${NC} | ${BLUE}/exit${NC}"
     echo -e "${GRAY}Tip: Press Tab for contextual suggestions. Use /help <query> to search.${NC}"
@@ -813,6 +1126,7 @@ print_help() {
         "Creation & Editing"
         "Execution & Tools"
         "AI Assistance"
+        "Agents"
         "Configuration & Profiles"
         "Navigation"
     )
@@ -834,6 +1148,15 @@ print_help() {
         "/explain <filename> - Explain code"
         "/fix <filename> <issue> - Fix code"
         "/selfmod <description> - Modify Cody"
+    )
+    local -a items_agents=(
+        "/agent list - List agents"
+        "/agent create <name> <system prompt> - Create an agent"
+        "/agent show <name> - Show agent configuration"
+        "/agent spawn <name> <task> - Spawn agent in a subprocess"
+        "/agent stop <name> [--force] - Stop a running agent"
+        "/agent logs <name> - Tail agent logs"
+        "/agent delete <name> - Delete an agent"
     )
     local -a items_config=(
         "/model - Select model"
@@ -857,6 +1180,7 @@ print_help() {
             "${items_creation[@]}" \
             "${items_execution[@]}" \
             "${items_ai[@]}" \
+            "${items_agents[@]}" \
             "${items_config[@]}" \
             "${items_nav[@]}" | grep -i "$query" | while IFS= read -r line; do
                 echo -e "  ${WHITE}${line}${NC}"
@@ -871,8 +1195,10 @@ print_help() {
     echo -e "${CYAN}${sections[2]}${NC}"
     for line in "${items_ai[@]}"; do echo -e "  ${WHITE}${line}${NC}"; done
     echo -e "${CYAN}${sections[3]}${NC}"
-    for line in "${items_config[@]}"; do echo -e "  ${WHITE}${line}${NC}"; done
+    for line in "${items_agents[@]}"; do echo -e "  ${WHITE}${line}${NC}"; done
     echo -e "${CYAN}${sections[4]}${NC}"
+    for line in "${items_config[@]}"; do echo -e "  ${WHITE}${line}${NC}"; done
+    echo -e "${CYAN}${sections[5]}${NC}"
     for line in "${items_nav[@]}"; do echo -e "  ${WHITE}${line}${NC}"; done
 }
 
@@ -1651,6 +1977,43 @@ handle_profile() {
     esac
 }
 
+handle_agent() {
+    local action="$1"
+    shift || true
+    case "$action" in
+        list|"")
+            agent_list
+            ;;
+        create)
+            local name="$1"
+            shift || true
+            agent_create "$name" "$*"
+            ;;
+        show)
+            agent_show "$1"
+            ;;
+        spawn)
+            local name="$1"
+            shift || true
+            agent_spawn "$name" "$*"
+            ;;
+        stop)
+            local name="$1"
+            shift || true
+            agent_stop "$name" "$1"
+            ;;
+        logs)
+            agent_logs "$1"
+            ;;
+        delete)
+            agent_delete "$1"
+            ;;
+        *)
+            echo -e "${YELLOW}Usage: /agent list|create|show|spawn|stop|logs|delete${NC}"
+            ;;
+    esac
+}
+
 # MAIN INPUT PARSER
 parse_input() {
     local input="$1"
@@ -1696,6 +2059,7 @@ parse_input() {
                 echo -e "${GREEN}✓ System prompt reloaded${NC}"
                 ;;
             "profile") handle_profile $args ;;
+            "agent") handle_agent $args ;;
             "wizard") run_onboarding_wizard ;;
             "clear")
                 > "$MEMORY_FILE"
