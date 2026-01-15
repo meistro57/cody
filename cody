@@ -60,7 +60,7 @@ TARGET="🎯"
 
 DEFAULT_COMMANDS=(
     "/create" "/edit" "/run" "/explain" "/fix" "/files" "/exec"
-    "/pip" "/npm" "/pnpm" "/yarn" "/selfmod" "/reload" "/status"
+    "/pip" "/npm" "/pnpm" "/yarn" "/crush" "/selfmod" "/reload" "/status"
     "/doctor" "/model" "/provider" "/clear" "/help" "/profile" "/agent" "/sandbox" "/wizard" "/exit"
 )
 
@@ -1744,7 +1744,7 @@ print_header() {
     echo -e "  ${BLUE}/fix${NC} <filename> <issue>           ${GRAY}Fix code${NC}"
     echo -e "  ${BLUE}/files${NC}                            ${GRAY}List files${NC}"
     echo -e "  ${BLUE}/exec${NC} <command>                   ${GRAY}Execute shell command${NC}"
-    echo -e "  ${BLUE}/pip${NC} <args> | ${BLUE}/npm${NC} <args> | ${BLUE}/pnpm${NC} <args> | ${BLUE}/yarn${NC} <args>"
+    echo -e "  ${BLUE}/pip${NC} <args> | ${BLUE}/npm${NC} <args> | ${BLUE}/pnpm${NC} <args> | ${BLUE}/yarn${NC} <args> | ${BLUE}/crush${NC} <args>"
     echo -e "  ${BLUE}/selfmod${NC} <description>            ${GRAY}Modify myself${NC}"
     echo -e "  ${BLUE}/reload${NC}                           ${GRAY}Reload system prompt${NC}"
     echo -e "  ${BLUE}/status${NC}                           ${GRAY}Show endpoint status${NC}"
@@ -1820,6 +1820,7 @@ print_help() {
         "/npm <args> - Run npm"
         "/pnpm <args> - Run pnpm"
         "/yarn <args> - Run yarn"
+        "/crush <args> - Run Charmbracelet Crush"
     )
     local -a items_ai=(
         "/explain <filename> - Explain code"
@@ -2128,6 +2129,22 @@ run_yarn_command() {
     execute_command "yarn $args"
 }
 
+run_crush_command() {
+    local args="$1"
+    if ! command -v crush > /dev/null; then
+        echo -e "${RED}✗ crush not available${NC}"
+        echo -e "${GRAY}Install from https://github.com/charmbracelet/crush and ensure it's on your PATH.${NC}"
+        return 1
+    fi
+
+    if [ -z "$args" ]; then
+        echo -e "${YELLOW}Usage: /crush <args>${NC}"
+        return 1
+    fi
+
+    execute_command "crush $args"
+}
+
 # SELF-MODIFICATION ENGINE
 modify_self() {
     local description="$1"
@@ -2183,7 +2200,7 @@ modify_self() {
 is_action_request() {
     local input="$1"
     
-    [[ "$input" =~ ^(rename|move|mv|create|make|delete|remove|copy|cp|chmod|mkdir|run|execute|test|check|verify|try|git|pip|pip3|python[[:space:]]+-m[[:space:]]+pip|npm|pnpm|yarn|add.*myself|modify.*myself|improve.*myself|apply.*upgrade|implement.*plan) ]]
+    [[ "$input" =~ ^(rename|move|mv|create|make|delete|remove|copy|cp|chmod|mkdir|run|execute|test|check|verify|try|git|pip|pip3|python[[:space:]]+-m[[:space:]]+pip|npm|pnpm|yarn|crush|add.*myself|modify.*myself|improve.*myself|apply.*upgrade|implement.*plan) ]]
 }
 
 # ACTION EXECUTOR
@@ -2267,6 +2284,10 @@ execute_action() {
             ;;
         yarn\ *)
             run_yarn_command "${input#yarn }"
+            return 0
+            ;;
+        crush\ *)
+            run_crush_command "${input#crush }"
             return 0
             ;;
         *"git "*)
@@ -2761,6 +2782,7 @@ parse_input() {
             "npm") run_npm_command "$args" ;;
             "pnpm") run_pnpm_command "$args" ;;
             "yarn") run_yarn_command "$args" ;;
+            "crush") run_crush_command "$args" ;;
             "selfmod") modify_self "$args" ;;
             "model") select_model ;;
             "provider") select_provider ;;
