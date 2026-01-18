@@ -127,6 +127,7 @@ Type `/help` in Cody for a list of commands:
 - `/fix <filename> <issue>` – Fix code for a specific issue
 - `/files [--no-dotfiles] [--sources]` – List files (hide dotfiles or show only source files)
 - `/exec <command>` – Execute a shell command (with safety checks)
+- `/crush <args>` – Run Charmbracelet Crush (if installed)
 - `/selfmod <description>` – Modify Cody itself
 - `/model` – Select model
 - `/reload` – Reload system prompt

@@ -39,6 +39,8 @@ This document outlines proposed enhancements and additional features for Cody. T
   - Stream output as tokens arrive for better responsiveness.
 - **Local tool runner**
   - Allow tool execution with explicit opt-in (e.g., linting, tests, formatting).
+- **CLI tool passthroughs**
+  - Provide dedicated commands (e.g., `/crush`) for trusted external coding tools with safety checks.
 
 ## 5) Developer Productivity
 
