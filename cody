@@ -117,7 +117,11 @@ load_agent_config() {
     AGENT_PROVIDER_NAME=""
     AGENT_SYSTEM_PROMPT=""
 
-    while IFS='=' read -r key value; do
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*#.*$ ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        local key="${line%%=*}"
+        local value="${line#*=}"
         case "$key" in
             WORK_DIR) AGENT_WORK_DIR="$value" ;;
             MODEL_NAME) AGENT_MODEL_NAME="$value" ;;
@@ -1158,9 +1162,12 @@ load_profile() {
         return 1
     fi
 
-    while IFS='=' read -r key value; do
-        key=$(echo "$key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-        value=$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        local key="${line%%=*}"
+        local value="${line#*=}"
+        key="${key#"${key%%[! ]*}"}"  # ltrim
+        key="${key%"${key##*[! ]}"}"  # rtrim
         case "$key" in
             WORK_DIR) WORK_DIR="$value" ;;
             API_PROVIDER) API_PROVIDER="$value" ;;
@@ -1479,13 +1486,18 @@ test_endpoint() {
 
 # Manage backup files - keep only MAX_BACKUPS
 manage_backups() {
-    local backup_pattern="$0.backup.*"
-    local backup_files=($(ls -t $backup_pattern 2>/dev/null))
-    
-    if [ ${#backup_files[@]} -gt $MAX_BACKUPS ]; then
+    local script_path
+    script_path=$(resolve_cody_bin)
+    shopt -s nullglob
+    local backup_files=("${script_path}.backup."*)
+    shopt -u nullglob
+
+    # Sort by modification time descending (newest first)
+    IFS=$'\n' backup_files=($(printf '%s\n' "${backup_files[@]}" | xargs ls -t 2>/dev/null))
+    unset IFS
+
+    if [ ${#backup_files[@]} -gt "$MAX_BACKUPS" ]; then
         echo -e "${BLUE}Managing backups (keeping $MAX_BACKUPS most recent)${NC}"
-        
-        # Remove oldest backups
         for ((i=MAX_BACKUPS; i<${#backup_files[@]}; i++)); do
             echo -e "${GRAY}Removing old backup: ${backup_files[i]##*/}${NC}"
             rm -f "${backup_files[i]}"
@@ -1906,19 +1918,28 @@ get_project_context() {
     local context="Project: $WORK_DIR
 "
     local file_count=0
-    cd "$WORK_DIR" || return
-    shopt -s nullglob
-    for file in *; do
-        if [ -f "$file" ] && [[ ! "$file" =~ ^cody ]] && [ ${#file} -lt 50 ]; then
-            local lines=$(wc -l < "$file" 2>/dev/null || echo "0")
+    local listing
+    listing=$(
+        cd "$WORK_DIR" || exit 1
+        shopt -s nullglob
+        for file in *; do
+            [ -f "$file" ] || continue
+            [[ "$file" =~ ^cody ]] && continue
+            [ ${#file} -lt 50 ] || continue
+            local lines
+            lines=$(wc -l < "$file" 2>/dev/null || echo "0")
             if [ "$lines" -lt 200 ]; then
-                context="$context- $file ($lines lines)
-"
-                ((file_count++))
+                echo "FILE:$file:$lines"
             fi
-        fi
-    done
-    shopt -u nullglob
+        done
+        shopt -u nullglob
+    )
+    while IFS=: read -r tag file lines; do
+        [ "$tag" = "FILE" ] || continue
+        context="$context- $file ($lines lines)
+"
+        ((file_count++))
+    done <<< "$listing"
     context="$context
 Files: $file_count
 "
@@ -1930,42 +1951,52 @@ call_gemma() {
     local prompt="$1"
     local custom_system_prompt="${2:-$SYSTEM_PROMPT}"
     local temperature="${3:-0.7}"
-    
-    local context=$(get_project_context)
+
+    local context
+    context=$(get_project_context)
     local full_prompt="$context
 
 User: $prompt"
-    
-    local escaped_prompt=$(echo "$full_prompt" | jq -Rs .)
-    local escaped_system=$(echo "$custom_system_prompt" | jq -Rs .)
-    
-    local messages="[{\"role\": \"system\", \"content\": $escaped_system}, {\"role\": \"user\", \"content\": $escaped_prompt}]"
-    
+
     local headers=()
     if ! build_request_headers headers; then
         return 1
     fi
 
-    local provider_payload=""
-    if [ "$API_PROVIDER" = "openrouter" ] && [ -n "$PROVIDER_NAME" ]; then
-        provider_payload=", \"provider\": {\"order\": [\"$PROVIDER_NAME\"], \"allow_fallbacks\": true}"
-    fi
+    # Build the JSON payload safely via jq to avoid injection from any variable
+    local payload
+    payload=$(jq -n \
+        --arg model "$MODEL_NAME" \
+        --arg system "$custom_system_prompt" \
+        --arg user "$full_prompt" \
+        --argjson temp "$temperature" \
+        --arg provider "$PROVIDER_NAME" \
+        --arg api_provider "$API_PROVIDER" \
+        '{
+            model: $model,
+            messages: [
+                {role: "system", content: $system},
+                {role: "user",   content: $user}
+            ],
+            temperature: $temp,
+            max_tokens: 4000
+        }
+        | if $api_provider == "openrouter" and $provider != "" then
+            . + {provider: {order: [$provider], allow_fallbacks: true}}
+          else . end')
 
     local response
     response=$(curl -s -w "\n%{http_code}" -X POST "$GEMMA_ENDPOINT/v1/chat/completions" \
         "${headers[@]}" \
         --connect-timeout "$CONNECT_TIMEOUT" \
         --max-time "$API_TIMEOUT" \
-        -d "{
-            \"model\": \"$MODEL_NAME\",
-            \"messages\": $messages,
-            \"temperature\": $temperature,
-            \"max_tokens\": 4000${provider_payload}
-        }" 2>/dev/null)
+        -d "$payload" 2>/dev/null)
 
     if [ -n "$response" ]; then
-        local http_code=$(echo "$response" | tail -n 1)
-        local body=$(echo "$response" | sed '$d')
+        local http_code
+        http_code=$(echo "$response" | tail -n 1)
+        local body
+        body=$(echo "$response" | sed '$d')
 
         if [[ ! "$http_code" =~ ^2 ]]; then
             if [ -z "$http_code" ] || [ "$http_code" = "000" ]; then
@@ -1976,12 +2007,13 @@ User: $prompt"
             return 1
         fi
 
-        local error=$(echo "$body" | jq -r '.error.message // empty' 2>/dev/null)
+        local error
+        error=$(echo "$body" | jq -r '.error.message // empty' 2>/dev/null)
         if [ -n "$error" ]; then
             echo -e "${RED}API Error: $error${NC}" >&2
             return 1
         fi
-        
+
         echo "$body" | jq -r '.choices[0].message.content // empty' 2>/dev/null
     else
         echo -e "${RED}API Error: Empty response${NC}" >&2
@@ -1990,11 +2022,15 @@ User: $prompt"
 }
 
 # Extract code blocks (extract all code blocks, not just the first)
+# Handles language specifiers like ```python, ```bash, etc.
 extract_code() {
     local response="$1"
     if echo "$response" | grep -q '```'; then
-        # Extract all code blocks between triple backticks
-        echo "$response" | awk '/```/{f=!f; next} f'
+        echo "$response" | awk '
+            /^```[a-zA-Z0-9_+-]*[[:space:]]*$/ { in_block = !in_block; next }
+            /^```[[:space:]]*$/ { in_block = !in_block; next }
+            in_block { print }
+        '
     else
         echo "$response"
     fi
@@ -2004,7 +2040,12 @@ extract_code() {
 format_output() {
     local text="$1"
     local prefix="${2:-}"
-    echo "$text" | fold -w 80 -s | sed "s/^/$prefix/"
+    local width
+    width=$(tput cols 2>/dev/null || echo 80)
+    # Account for prefix length
+    local wrap_width=$(( width - ${#prefix} - 2 ))
+    [ "$wrap_width" -lt 40 ] && wrap_width=40
+    echo "$text" | fold -w "$wrap_width" -s | sed "s/^/$prefix/"
 }
 
 # Save to memory
@@ -2392,27 +2433,58 @@ handle_run() {
     # Remove any trailing whitespace from filename
     filename=$(echo "$filename" | sed 's/[[:space:]]*$//')
     local target="$filename"
-    
+
     if [ ! -f "$target" ]; then
         echo -e "${RED}✗ File not found: $filename${NC}"
         return 1
     fi
-    
+
     echo -e "${BLUE}${ROCKET_ICON} Running $filename...${NC}"
     echo -e "${GRAY}────────────────────────────────────────${NC}"
-    
-    # Already in current directory, no need to change
+
+    local exit_code=0
     case "$filename" in
-        *.py) python3 "$filename" || python "$filename" ;;
-        *.js) node "$filename" ;;
-        *.sh) bash "$filename" ;;
-        *.rb) ruby "$filename" ;;
-        *.go) go run "$filename" ;;
-        *) echo -e "${YELLOW}Unknown file type: $filename${NC}" ;;
+        *.py)
+            if command -v python3 > /dev/null 2>&1; then
+                python3 "$filename"; exit_code=$?
+            elif command -v python > /dev/null 2>&1; then
+                python "$filename"; exit_code=$?
+            else
+                echo -e "${RED}✗ python3/python not found${NC}"; exit_code=1
+            fi
+            ;;
+        *.js)
+            if command -v node > /dev/null 2>&1; then
+                node "$filename"; exit_code=$?
+            else
+                echo -e "${RED}✗ node not found${NC}"; exit_code=1
+            fi
+            ;;
+        *.sh) bash "$filename"; exit_code=$? ;;
+        *.rb)
+            if command -v ruby > /dev/null 2>&1; then
+                ruby "$filename"; exit_code=$?
+            else
+                echo -e "${RED}✗ ruby not found${NC}"; exit_code=1
+            fi
+            ;;
+        *.go)
+            if command -v go > /dev/null 2>&1; then
+                go run "$filename"; exit_code=$?
+            else
+                echo -e "${RED}✗ go not found${NC}"; exit_code=1
+            fi
+            ;;
+        *) echo -e "${YELLOW}Unknown file type: $filename${NC}"; exit_code=1 ;;
     esac
-    
+
     echo -e "${GRAY}────────────────────────────────────────${NC}"
-    echo -e "${GREEN}✓ Finished${NC}"
+    if [ $exit_code -eq 0 ]; then
+        echo -e "${GREEN}✓ Finished (exit 0)${NC}"
+    else
+        echo -e "${RED}✗ Finished with exit code $exit_code${NC}"
+    fi
+    return $exit_code
 }
 
 handle_explain() {
@@ -2498,34 +2570,51 @@ handle_files() {
     echo -e "${BLUE}📄 Files in: ${WORK_DIR}${NC}"
     echo
     local file_count=0 total_lines=0
-    cd "$WORK_DIR" || return
-    shopt -s nullglob
-    for file in * .*; do
+    local listing
+    listing=$(
+        cd "$WORK_DIR" || exit 1
+        shopt -s nullglob
+        for file in * .*; do
+            [ -f "$file" ] || continue
+            [ "$file" = "." ] || [ "$file" = ".." ] && continue
+            echo "$file"
+        done
+        shopt -u nullglob
+    )
+    while IFS= read -r file; do
+        [ -z "$file" ] && continue
         # Optionally skip dotfiles
-        if [ $show_dotfiles -eq 0 ] && [[ "$file" == .* ]]; then
+        if [ "$show_dotfiles" -eq 0 ] && [[ "$file" == .* ]]; then
             continue
         fi
         # Optionally show only source files
-        if [ $only_sources -eq 1 ] && [[ ! "$file" =~ \.(py|js|sh|rb|go|ts|c|cpp|java|rs|pl|php|lua|swift|scala|kt|cs|hs|jl|m|r|sql|json|yaml|yml|toml|ini|cfg|xml|html|css|md|txt)$ ]]; then
+        if [ "$only_sources" -eq 1 ] && [[ ! "$file" =~ \.(py|js|sh|rb|go|ts|c|cpp|java|rs|pl|php|lua|swift|scala|kt|cs|hs|jl|m|r|sql|json|yaml|yml|toml|ini|cfg|xml|html|css|md|txt)$ ]]; then
             continue
         fi
-        if [ -f "$file" ] && [ "$file" != "." ] && [ "$file" != ".." ]; then
-            local lines=$(wc -l < "$file" 2>/dev/null || echo "0")
-            local size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo "0")
-            local size_str=""; [ "$size" -gt 1048576 ] && size_str="$(( size / 1048576 ))MB" || { [ "$size" -gt 1024 ] && size_str="$(( size / 1024 ))KB" || size_str="${size}B"; }
-            case "$file" in
-                *.py) echo -e "  🐍 ${GREEN}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
-                *.js) echo -e "  📜 ${YELLOW}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
-                *.txt) echo -e "  📄 ${WHITE}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
-                *.md) echo -e "  📝 ${BLUE}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
-                *.sh) echo -e "  ⚡ ${GREEN}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
-                .*) echo -e "  🔒 ${GRAY}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
-                *) echo -e "  📄 ${WHITE}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
-            esac
-            ((file_count++)); ((total_lines += lines))
+        local target="$WORK_DIR/$file"
+        local lines
+        lines=$(wc -l < "$target" 2>/dev/null || echo "0")
+        local size
+        size=$(stat -c%s "$target" 2>/dev/null || stat -f%z "$target" 2>/dev/null || echo "0")
+        local size_str
+        if [ "$size" -gt 1048576 ]; then
+            size_str="$(( size / 1048576 ))MB"
+        elif [ "$size" -gt 1024 ]; then
+            size_str="$(( size / 1024 ))KB"
+        else
+            size_str="${size}B"
         fi
-    done
-    shopt -u nullglob
+        case "$file" in
+            *.py) echo -e "  🐍 ${GREEN}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
+            *.js) echo -e "  📜 ${YELLOW}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
+            *.txt) echo -e "  📄 ${WHITE}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
+            *.md) echo -e "  📝 ${BLUE}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
+            *.sh) echo -e "  ⚡ ${GREEN}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
+            .*) echo -e "  🔒 ${GRAY}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
+            *) echo -e "  📄 ${WHITE}${file}${NC} ${GRAY}(${lines} lines, ${size_str})${NC}" ;;
+        esac
+        ((file_count++)); ((total_lines += lines))
+    done <<< "$listing"
     echo; echo -e "${GRAY}📊 Total: ${file_count} files, ${total_lines} lines${NC}"
     if [ $show_dotfiles -eq 1 ]; then
         echo -e "${GRAY}Tip: Use '/files --no-dotfiles' to hide dotfiles.${NC}"
@@ -2756,46 +2845,48 @@ parse_input() {
     fi
 
     if [[ "$input" =~ ^/[a-zA-Z] ]]; then
-        local command=$(echo "$input" | sed 's/^\/\([a-zA-Z]*\).*/\1/')
-        local args=$(echo "$input" | sed 's/^\/[a-zA-Z]* *//')
+        local command
+        command=$(echo "$input" | sed 's/^\/\([a-zA-Z]*\).*/\1/')
+        local args
+        args=$(echo "$input" | sed 's/^\/[a-zA-Z]* *//')
+        # Split args into an array for commands that need multiple positional params
+        local -a argv
+        read -ra argv <<< "$args"
 
         case "$command" in
             "create")
-                local filename=$(echo "$args" | awk '{print $1}')
-                local description=$(echo "$args" | cut -d' ' -f2-)
+                local filename="${argv[0]:-}"
+                local description="${args#"${argv[0]:-}" }"
                 handle_create "$filename" "$description"
                 ;;
             "edit") handle_edit "$args" ;;
             "run") handle_run "$args" ;;
             "explain") handle_explain "$args" ;;
             "fix")
-                local filename=$(echo "$args" | awk '{print $1}')
-                local issue=$(echo "$args" | cut -d' ' -f2-)
+                local filename="${argv[0]:-}"
+                local issue="${args#"${argv[0]:-}" }"
                 handle_fix "$filename" "$issue"
                 ;;
-            "files")
-                # Allow /files --no-dotfiles and /files --sources
-                handle_files $args
-                ;;
-            "exec") execute_command "$args" ;;
-            "pip") run_pip_command "$args" ;;
-            "npm") run_npm_command "$args" ;;
-            "pnpm") run_pnpm_command "$args" ;;
-            "yarn") run_yarn_command "$args" ;;
-            "crush") run_crush_command "$args" ;;
+            "files")   handle_files "${argv[@]}" ;;
+            "exec")    execute_command "$args" ;;
+            "pip")     run_pip_command "$args" ;;
+            "npm")     run_npm_command "$args" ;;
+            "pnpm")    run_pnpm_command "$args" ;;
+            "yarn")    run_yarn_command "$args" ;;
+            "crush")   run_crush_command "$args" ;;
             "selfmod") modify_self "$args" ;;
-            "model") select_model ;;
+            "model")   select_model ;;
             "provider") select_provider ;;
-            "status") handle_status ;;
-            "doctor") handle_doctor ;;
+            "status")  handle_status ;;
+            "doctor")  handle_doctor ;;
             "reload")
                 load_system_prompt
                 echo -e "${GREEN}✓ System prompt reloaded${NC}"
                 ;;
-            "profile") handle_profile $args ;;
-            "agent") handle_agent $args ;;
-            "sandbox") handle_sandbox $args ;;
-            "wizard") run_onboarding_wizard ;;
+            "profile") handle_profile "${argv[@]}" ;;
+            "agent")   handle_agent   "${argv[@]}" ;;
+            "sandbox") handle_sandbox "${argv[@]}" ;;
+            "wizard")  run_onboarding_wizard ;;
             "clear")
                 > "$MEMORY_FILE"
                 echo -e "${YELLOW}✓ Cleared${NC}"
@@ -2834,17 +2925,19 @@ main() {
     while true; do
         printf "${GREEN}❯${NC} "  # More distinct prompt with a space
         input=$(read_input_enhanced)
+        local read_status=$?
 
-        # ESC pressed: cancel and return to prompt
-        if [[ "$input" == "__CODY_ESC__" ]] || [ $? -eq 130 ]; then
-            echo -e "${YELLOW}↩️  Cancelled. Back to prompt.${NC}"
-            echo -e "${GRAY}────────────────────────────────────────${NC}"  # Divider after cancel
-            continue
-        fi
-
-        if [ $? -ne 0 ]; then
+        # EOF (Ctrl-D): exit gracefully
+        if [ $read_status -ne 0 ] && [ $read_status -ne 130 ]; then
             echo -e "\n${YELLOW}Goodbye!${NC}"
             break
+        fi
+
+        # ESC pressed: cancel and return to prompt
+        if [[ "$input" == "__CODY_ESC__" ]] || [ $read_status -eq 130 ]; then
+            echo -e "${YELLOW}↩️  Cancelled. Back to prompt.${NC}"
+            echo -e "${GRAY}────────────────────────────────────────${NC}"
+            continue
         fi
 
         parse_input "$input"
