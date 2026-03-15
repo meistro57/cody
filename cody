@@ -1,4 +1,5 @@
 #!/bin/bash
+# cody
 
 # Load .env if present
 if [ -f "$PWD/.env" ]; then
@@ -18,13 +19,27 @@ fi
 # Configuration
 GEMMA_ENDPOINT="${GEMMA_ENDPOINT:-http://10.0.0.201:1234}"
 OLLAMA_ENDPOINT="${OLLAMA_ENDPOINT:-http://127.0.0.1:11434}"
+OPENROUTER_ENDPOINT="${OPENROUTER_ENDPOINT:-https://openrouter.ai/api/v1}"
+OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
+OPENROUTER_APP_NAME="${OPENROUTER_APP_NAME:-Cody}"
+OPENROUTER_HTTP_REFERER="${OPENROUTER_HTTP_REFERER:-}"
 MODEL_NAME="${MODEL_NAME:-mistralai/codestral-22b-v0.1}"
+API_PROVIDER="${API_PROVIDER:-lmstudio}"
+PROVIDER_NAME=""
 MEMORY_FILE="${MEMORY_FILE:-$HOME/.cody_global_memory}"
 HISTORY_FILE="${HISTORY_FILE:-$HOME/.cody_history}"
 WORK_DIR="${WORK_DIR:-$(pwd)}"
 SYSTEM_PROMPT=""
 MAX_BACKUPS="${MAX_BACKUPS:-5}"
-STREAM_OUTPUT="${STREAM_OUTPUT:-0}"
+API_TIMEOUT="${API_TIMEOUT:-30}"
+CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-5}"
+CODY_PROFILES_FILE="${CODY_PROFILES_FILE:-$HOME/.cody_profiles}"
+PROFILE_NAME=""
+ONBOARDING_FLAG="${ONBOARDING_FLAG:-$HOME/.cody_onboarded}"
+DEFAULT_PROFILE_MEMORY_DIR="${DEFAULT_PROFILE_MEMORY_DIR:-$HOME}"
+AGENTS_DIR="${AGENTS_DIR:-$HOME/.cody_agents}"
+SANDBOX_ROOT="${SANDBOX_ROOT:-$HOME/.cody_sandboxes}"
+SANDBOX_AUTO_VENV="${SANDBOX_AUTO_VENV:-1}"
 
 # Colors
 RED='\033[0;31m'
@@ -43,9 +58,20 @@ GEAR="⚙️"
 LIGHTNING="⚡"
 TARGET="🎯"
 
+DEFAULT_COMMANDS=(
+    "/create" "/edit" "/run" "/explain" "/fix" "/files" "/exec"
+    "/pip" "/npm" "/pnpm" "/yarn" "/crush" "/selfmod" "/reload" "/status"
+    "/doctor" "/model" "/provider" "/clear" "/help" "/profile" "/agent" "/sandbox" "/wizard" "/exit"
+)
+
+FILE_COMMANDS=("/create" "/edit" "/run" "/explain" "/fix")
+
 # Load system prompt from file
 load_system_prompt() {
-    if [ -f "$WORK_DIR/cody_system.txt" ]; then
+    if [ -n "$CODY_SYSTEM_PROMPT" ]; then
+        SYSTEM_PROMPT="$CODY_SYSTEM_PROMPT"
+        echo -e "${GREEN}✓ Loaded system prompt: CODY_SYSTEM_PROMPT${NC}"
+    elif [ -f "$WORK_DIR/cody_system.txt" ]; then
         SYSTEM_PROMPT=$(cat "$WORK_DIR/cody_system.txt")
         echo -e "${GREEN}✓ Loaded system prompt: cody_system.txt${NC}"
     elif [ -f "$HOME/.cody_system_prompt" ]; then
@@ -57,18 +83,1422 @@ load_system_prompt() {
     fi
 }
 
+# Agent helpers
+ensure_agents_dir() {
+    mkdir -p "$AGENTS_DIR"
+}
+
+is_valid_agent_name() {
+    local name="$1"
+    [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]]
+}
+
+agent_dir_for() {
+    local name="$1"
+    echo "$AGENTS_DIR/$name"
+}
+
+load_agent_config() {
+    local name="$1"
+    local agent_dir
+    agent_dir=$(agent_dir_for "$name")
+    local config_file="$agent_dir/agent.conf"
+    local prompt_file="$agent_dir/system_prompt.txt"
+
+    if [ ! -d "$agent_dir" ] || [ ! -f "$config_file" ]; then
+        echo -e "${RED}✗ Agent not found: $name${NC}"
+        return 1
+    fi
+
+    AGENT_NAME="$name"
+    AGENT_WORK_DIR=""
+    AGENT_MODEL_NAME=""
+    AGENT_API_PROVIDER=""
+    AGENT_PROVIDER_NAME=""
+    AGENT_SYSTEM_PROMPT=""
+
+    while IFS='=' read -r key value; do
+        case "$key" in
+            WORK_DIR) AGENT_WORK_DIR="$value" ;;
+            MODEL_NAME) AGENT_MODEL_NAME="$value" ;;
+            API_PROVIDER) AGENT_API_PROVIDER="$value" ;;
+            PROVIDER_NAME) AGENT_PROVIDER_NAME="$value" ;;
+        esac
+    done < "$config_file"
+
+    if [ -f "$prompt_file" ]; then
+        AGENT_SYSTEM_PROMPT=$(cat "$prompt_file")
+    else
+        AGENT_SYSTEM_PROMPT="$SYSTEM_PROMPT"
+    fi
+
+    AGENT_WORK_DIR="${AGENT_WORK_DIR:-$WORK_DIR}"
+    AGENT_MODEL_NAME="${AGENT_MODEL_NAME:-$MODEL_NAME}"
+    AGENT_API_PROVIDER="${AGENT_API_PROVIDER:-$API_PROVIDER}"
+    AGENT_PROVIDER_NAME="${AGENT_PROVIDER_NAME:-$PROVIDER_NAME}"
+    AGENT_DIR="$agent_dir"
+}
+
+resolve_cody_bin() {
+    if [ -n "$CODY_BIN" ] && [ -x "$CODY_BIN" ]; then
+        echo "$CODY_BIN"
+        return 0
+    fi
+
+    local resolved=""
+    if command -v readlink > /dev/null 2>&1; then
+        resolved=$(readlink -f "$0" 2>/dev/null || true)
+    fi
+
+    if [ -n "$resolved" ]; then
+        echo "$resolved"
+        return 0
+    fi
+
+    local from_path
+    from_path=$(command -v cody 2>/dev/null || true)
+    if [ -n "$from_path" ]; then
+        echo "$from_path"
+        return 0
+    fi
+
+    echo "$0"
+}
+
+agent_create() {
+    local name="$1"
+    shift || true
+    local prompt="$*"
+
+    if [ -z "$name" ] || [ -z "$prompt" ]; then
+        echo -e "${YELLOW}Usage: /agent create <name> <system prompt>${NC}"
+        return 1
+    fi
+
+    if ! is_valid_agent_name "$name"; then
+        echo -e "${RED}✗ Invalid agent name. Use letters, numbers, '-' or '_' only.${NC}"
+        return 1
+    fi
+
+    ensure_agents_dir
+    local agent_dir
+    agent_dir=$(agent_dir_for "$name")
+    mkdir -p "$agent_dir"
+
+    printf "%s\n" "$prompt" > "$agent_dir/system_prompt.txt"
+    cat <<EOF > "$agent_dir/agent.conf"
+NAME=$name
+WORK_DIR=$WORK_DIR
+MODEL_NAME=$MODEL_NAME
+API_PROVIDER=$API_PROVIDER
+PROVIDER_NAME=$PROVIDER_NAME
+EOF
+
+    echo -e "${GREEN}✓ Agent created: $name${NC}"
+}
+
+agent_list() {
+    ensure_agents_dir
+    shopt -s nullglob
+    local entries=("$AGENTS_DIR"/*)
+    shopt -u nullglob
+    if [ ${#entries[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No agents found yet.${NC}"
+        return 0
+    fi
+
+    echo -e "${BLUE}🧩 Agents:${NC}"
+    for entry in "${entries[@]}"; do
+        [ -d "$entry" ] || continue
+        local name
+        name=$(basename "$entry")
+        local status="idle"
+        local pid_file="$entry/agent.pid"
+        if [ -f "$pid_file" ]; then
+            local pid
+            pid=$(cat "$pid_file")
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                status="running (pid $pid)"
+            else
+                status="stopped"
+            fi
+        fi
+        echo -e "  ${WHITE}${name}${NC} ${GRAY}(${status})${NC}"
+    done
+}
+
+agent_show() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo -e "${YELLOW}Usage: /agent show <name>${NC}"
+        return 1
+    fi
+
+    if ! load_agent_config "$name"; then
+        return 1
+    fi
+
+    echo -e "${BLUE}🧩 Agent: ${name}${NC}"
+    echo -e "  ${CYAN}Work dir:${NC} ${AGENT_WORK_DIR}"
+    echo -e "  ${CYAN}Model:${NC} ${AGENT_MODEL_NAME}"
+    echo -e "  ${CYAN}Provider:${NC} ${AGENT_API_PROVIDER}"
+    if [ -n "$AGENT_PROVIDER_NAME" ]; then
+        echo -e "  ${CYAN}OpenRouter Provider:${NC} ${AGENT_PROVIDER_NAME}"
+    fi
+    echo -e "  ${CYAN}System Prompt:${NC}"
+    echo "$AGENT_SYSTEM_PROMPT" | while IFS= read -r line; do
+        echo -e "    ${GRAY}${line}${NC}"
+    done
+}
+
+agent_delete() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo -e "${YELLOW}Usage: /agent delete <name>${NC}"
+        return 1
+    fi
+
+    local agent_dir
+    agent_dir=$(agent_dir_for "$name")
+    if [ ! -d "$agent_dir" ]; then
+        echo -e "${RED}✗ Agent not found: $name${NC}"
+        return 1
+    fi
+
+    rm -rf "$agent_dir"
+    echo -e "${GREEN}✓ Deleted agent: $name${NC}"
+}
+
+agent_spawn() {
+    local name="$1"
+    shift || true
+    local task="$*"
+
+    if [ -z "$name" ] || [ -z "$task" ]; then
+        echo -e "${YELLOW}Usage: /agent spawn <name> <task>${NC}"
+        return 1
+    fi
+
+    if ! load_agent_config "$name"; then
+        return 1
+    fi
+
+    local log_file="$AGENT_DIR/agent.log"
+    local pid_file="$AGENT_DIR/agent.pid"
+    local memory_file="$AGENT_DIR/memory.log"
+    local history_file="$AGENT_DIR/history.log"
+
+    local cody_bin
+    cody_bin=$(resolve_cody_bin)
+    if [ ! -x "$cody_bin" ]; then
+        echo -e "${RED}✗ Cody executable not found: $cody_bin${NC}"
+        return 1
+    fi
+
+    if command -v nohup > /dev/null 2>&1; then
+        nohup env \
+            CODY_SYSTEM_PROMPT="$AGENT_SYSTEM_PROMPT" \
+            WORK_DIR="$AGENT_WORK_DIR" \
+            MEMORY_FILE="$memory_file" \
+            HISTORY_FILE="$history_file" \
+            MODEL_NAME="$AGENT_MODEL_NAME" \
+            API_PROVIDER="$AGENT_API_PROVIDER" \
+            PROVIDER_NAME="$AGENT_PROVIDER_NAME" \
+            GEMMA_ENDPOINT="$GEMMA_ENDPOINT" \
+            OLLAMA_ENDPOINT="$OLLAMA_ENDPOINT" \
+            OPENROUTER_ENDPOINT="$OPENROUTER_ENDPOINT" \
+            OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
+            OPENROUTER_APP_NAME="$OPENROUTER_APP_NAME" \
+            OPENROUTER_HTTP_REFERER="$OPENROUTER_HTTP_REFERER" \
+            "$cody_bin" <<< "$task" > "$log_file" 2>&1 &
+    else
+        env \
+            CODY_SYSTEM_PROMPT="$AGENT_SYSTEM_PROMPT" \
+            WORK_DIR="$AGENT_WORK_DIR" \
+            MEMORY_FILE="$memory_file" \
+            HISTORY_FILE="$history_file" \
+            MODEL_NAME="$AGENT_MODEL_NAME" \
+            API_PROVIDER="$AGENT_API_PROVIDER" \
+            PROVIDER_NAME="$AGENT_PROVIDER_NAME" \
+            GEMMA_ENDPOINT="$GEMMA_ENDPOINT" \
+            OLLAMA_ENDPOINT="$OLLAMA_ENDPOINT" \
+            OPENROUTER_ENDPOINT="$OPENROUTER_ENDPOINT" \
+            OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
+            OPENROUTER_APP_NAME="$OPENROUTER_APP_NAME" \
+            OPENROUTER_HTTP_REFERER="$OPENROUTER_HTTP_REFERER" \
+            "$cody_bin" <<< "$task" > "$log_file" 2>&1 &
+    fi
+
+    local pid=$!
+    echo "$pid" > "$pid_file"
+    if command -v disown > /dev/null 2>&1; then
+        disown "$pid" 2>/dev/null || true
+    fi
+
+    echo -e "${GREEN}✓ Spawned agent '${name}' (pid ${pid})${NC}"
+    echo -e "${GRAY}Logs: ${log_file}${NC}"
+}
+
+agent_stop() {
+    local name="$1"
+    local mode="$2"
+    if [ -z "$name" ]; then
+        echo -e "${YELLOW}Usage: /agent stop <name> [--force]${NC}"
+        return 1
+    fi
+
+    local agent_dir
+    agent_dir=$(agent_dir_for "$name")
+    local pid_file="$agent_dir/agent.pid"
+    if [ ! -f "$pid_file" ]; then
+        echo -e "${RED}✗ No running agent recorded for: $name${NC}"
+        return 1
+    fi
+
+    local pid
+    pid=$(cat "$pid_file")
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        echo -e "${YELLOW}⚠️  Agent already stopped: $name${NC}"
+        rm -f "$pid_file"
+        return 0
+    fi
+
+    if [ "$mode" = "--force" ]; then
+        kill -9 "$pid" 2>/dev/null || true
+        echo -e "${GREEN}✓ Force-stopped agent '${name}' (pid ${pid})${NC}"
+        return 0
+    fi
+
+    kill "$pid" 2>/dev/null || true
+    echo -e "${GREEN}✓ Stopped agent '${name}' (pid ${pid})${NC}"
+}
+
+agent_logs() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo -e "${YELLOW}Usage: /agent logs <name>${NC}"
+        return 1
+    fi
+
+    local agent_dir
+    agent_dir=$(agent_dir_for "$name")
+    local log_file="$agent_dir/agent.log"
+    if [ ! -f "$log_file" ]; then
+        echo -e "${YELLOW}No log file found for agent: $name${NC}"
+        return 0
+    fi
+
+    echo -e "${BLUE}📜 Logs (${name})${NC}"
+    tail -n 50 "$log_file"
+}
+
+# Sandbox helpers
+ensure_sandbox_root() {
+    mkdir -p "$SANDBOX_ROOT"
+}
+
+is_valid_sandbox_name() {
+    local name="$1"
+    [[ "$name" =~ ^[a-zA-Z0-9._-]+$ ]]
+}
+
+sandbox_dir_for() {
+    local name="$1"
+    echo "$SANDBOX_ROOT/$name"
+}
+
+maybe_create_venv() {
+    local dir="$1"
+    local enabled="$2"
+    if [ "$enabled" -ne 1 ]; then
+        return 0
+    fi
+
+    if ! command -v python3 > /dev/null 2>&1; then
+        echo -e "${YELLOW}⚠️  python3 not found; skipping venv creation.${NC}"
+        return 0
+    fi
+
+    if python3 -m venv "$dir/.venv"; then
+        echo -e "${GREEN}✓ Created virtual environment: ${dir}/.venv${NC}"
+    else
+        echo -e "${YELLOW}⚠️  Failed to create venv at ${dir}/.venv${NC}"
+    fi
+}
+
+sandbox_write_rag_templates() {
+    local dir="$1"
+    mkdir -p "$dir/documents"
+
+    cat <<'EOF' > "$dir/config.py"
+# config.py
+from dataclasses import dataclass
+from pathlib import Path
+
+# Default values chosen to be sensible for a local sandbox.
+BASE_DIR = Path(__file__).resolve().parent
+DOCUMENTS_DIR = BASE_DIR / "documents"
+INDEX_PATH = BASE_DIR / "index.json"
+TOP_K = 3
+
+@dataclass(frozen=True)
+class RagConfig:
+    documents_dir: Path = DOCUMENTS_DIR
+    index_path: Path = INDEX_PATH
+    top_k: int = TOP_K
+EOF
+
+    cat <<'EOF' > "$dir/rag_sandbox.py"
+# rag_sandbox.py
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Tuple
+
+import config
+
+
+TOKEN_RE = re.compile(r"[A-Za-z0-9']+")
+
+
+@dataclass
+class DocumentVector:
+    path: str
+    term_freq: Dict[str, int]
+    norm: float
+
+
+def tokenize(text: str) -> List[str]:
+    return [match.group(0).lower() for match in TOKEN_RE.finditer(text)]
+
+
+def load_documents(documents_dir: Path) -> Dict[str, str]:
+    documents: Dict[str, str] = {}
+    for path in sorted(documents_dir.glob("*.txt")) + sorted(documents_dir.glob("*.md")):
+        try:
+            documents[str(path)] = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"Blimey, couldn't read {path}: {exc}")
+    return documents
+
+
+def build_vectors(documents: Dict[str, str]) -> List[DocumentVector]:
+    vectors: List[DocumentVector] = []
+    for path, content in documents.items():
+        terms = Counter(tokenize(content))
+        norm = math.sqrt(sum(freq * freq for freq in terms.values()))
+        vectors.append(DocumentVector(path=path, term_freq=dict(terms), norm=norm))
+    return vectors
+
+
+def save_index(vectors: Iterable[DocumentVector], index_path: Path) -> None:
+    payload = {
+        "documents": [
+            {"path": vector.path, "term_freq": vector.term_freq, "norm": vector.norm}
+            for vector in vectors
+        ]
+    }
+    index_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def load_index(index_path: Path) -> List[DocumentVector]:
+    try:
+        data = json.loads(index_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise RuntimeError(f"Index file missing or unreadable: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Index file is not valid JSON: {exc}") from exc
+
+    vectors: List[DocumentVector] = []
+    for item in data.get("documents", []):
+        vectors.append(
+            DocumentVector(
+                path=item.get("path", "unknown"),
+                term_freq=item.get("term_freq", {}),
+                norm=float(item.get("norm", 0.0)),
+            )
+        )
+    return vectors
+
+
+def cosine_similarity(query_vec: Counter, doc_vec: DocumentVector) -> float:
+    if doc_vec.norm == 0:
+        return 0.0
+    dot = sum(query_vec.get(term, 0) * freq for term, freq in doc_vec.term_freq.items())
+    query_norm = math.sqrt(sum(freq * freq for freq in query_vec.values()))
+    if query_norm == 0:
+        return 0.0
+    return dot / (query_norm * doc_vec.norm)
+
+
+def query_index(query: str, vectors: List[DocumentVector], top_k: int) -> List[Tuple[float, DocumentVector]]:
+    query_vec = Counter(tokenize(query))
+    scored = [(cosine_similarity(query_vec, vec), vec) for vec in vectors]
+    return sorted(scored, key=lambda item: item[0], reverse=True)[:top_k]
+
+
+def handle_index(cfg: config.RagConfig) -> None:
+    cfg.documents_dir.mkdir(parents=True, exist_ok=True)
+    documents = load_documents(cfg.documents_dir)
+    if not documents:
+        print("No documents found. Pop a few .txt or .md files into documents/ first.")
+        return
+    vectors = build_vectors(documents)
+    save_index(vectors, cfg.index_path)
+    print(f"Sorted. Indexed {len(vectors)} document(s) into {cfg.index_path}.")
+
+
+def handle_query(cfg: config.RagConfig, query: str) -> None:
+    vectors = load_index(cfg.index_path)
+    results = query_index(query, vectors, cfg.top_k)
+    print(f"Top {cfg.top_k} results for '{query}':")
+    for score, vec in results:
+        label = Path(vec.path).name
+        print(f"  • {label} (score {score:.3f})")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Lightweight RAG sandbox (no external deps).")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("index", help="Build or refresh the vector index.")
+
+    query_parser = subparsers.add_parser("query", help="Query the vector index.")
+    query_parser.add_argument("text", help="Search text for retrieval.")
+    return parser
+
+
+def main() -> None:
+    cfg = config.RagConfig()
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command == "index":
+        handle_index(cfg)
+    elif args.command == "query":
+        handle_query(cfg, args.text)
+
+
+if __name__ == "__main__":
+    main()
+EOF
+
+    cat <<'EOF' > "$dir/documents/sample.txt"
+This is a tiny sandbox document about Cody.
+It mentions RAG, MCP, cron jobs, and virtual environments for testing.
+EOF
+}
+
+sandbox_write_mcp_templates() {
+    local dir="$1"
+
+    cat <<'EOF' > "$dir/config.py"
+# config.py
+from dataclasses import dataclass
+from pathlib import Path
+
+# Default values chosen for a self-contained MCP sandbox.
+BASE_DIR = Path(__file__).resolve().parent
+LOG_PATH = BASE_DIR / "mcp_sandbox.log"
+
+@dataclass(frozen=True)
+class McpConfig:
+    log_path: Path = LOG_PATH
+EOF
+
+    cat <<'EOF' > "$dir/mcp_sandbox.py"
+# mcp_sandbox.py
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime
+from typing import Any, Dict
+
+import config
+
+
+TOOLS = {
+    "echo": {
+        "description": "Echo the payload back to the caller.",
+        "handler": lambda params: {"echo": params},
+    },
+    "time": {
+        "description": "Return the current UTC time.",
+        "handler": lambda params: {"utc": datetime.utcnow().isoformat() + "Z"},
+    },
+}
+
+RESOURCES = [
+    {"uri": "sandbox://status", "name": "Sandbox status", "mime": "application/json"},
+]
+
+
+def log_line(message: str) -> None:
+    timestamp = datetime.utcnow().isoformat()
+    log_path = config.McpConfig().log_path
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"[{timestamp}] {message}\n")
+
+
+def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
+    method = request.get("method", "")
+    request_id = request.get("id")
+
+    if method == "mcp.list_tools":
+        result = [{"name": name, "description": tool["description"]} for name, tool in TOOLS.items()]
+        return {"id": request_id, "result": result}
+    if method == "mcp.list_resources":
+        return {"id": request_id, "result": RESOURCES}
+    if method == "mcp.call_tool":
+        tool_name = request.get("params", {}).get("name")
+        tool = TOOLS.get(tool_name)
+        if not tool:
+            return {"id": request_id, "error": f"Unknown tool: {tool_name}"}
+        payload = request.get("params", {}).get("payload", {})
+        return {"id": request_id, "result": tool["handler"](payload)}
+
+    return {"id": request_id, "error": f"Unknown method: {method}"}
+
+
+def serve_stdio() -> None:
+    print("MCP sandbox ready. Send JSON-RPC lines; Ctrl+D to stop.")
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError as exc:
+            response = {"id": None, "error": f"Invalid JSON: {exc}"}
+        else:
+            response = handle_request(request)
+        print(json.dumps(response), flush=True)
+        log_line(f"Handled: {line}")
+
+
+def call_tool(tool_name: str, payload: Dict[str, Any]) -> None:
+    request = {"id": "local", "method": "mcp.call_tool", "params": {"name": tool_name, "payload": payload}}
+    response = handle_request(request)
+    print(json.dumps(response, indent=2))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Minimal MCP sandbox over stdin/stdout.")
+    parser.add_argument("--serve", action="store_true", help="Run the MCP sandbox server.")
+    parser.add_argument("--call", metavar="TOOL", help="Call a tool locally (e.g., echo, time).")
+    parser.add_argument("--payload", default="{}", help="JSON payload for --call.")
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.serve:
+        serve_stdio()
+        return
+
+    if args.call:
+        try:
+            payload = json.loads(args.payload)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"Payload must be valid JSON: {exc}") from exc
+        call_tool(args.call, payload)
+        return
+
+    parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
+EOF
+}
+
+sandbox_write_cron_templates() {
+    local dir="$1"
+
+    cat <<'EOF' > "$dir/config.py"
+# config.py
+from dataclasses import dataclass
+from pathlib import Path
+
+# Default values chosen for a local cron sandbox.
+BASE_DIR = Path(__file__).resolve().parent
+CRON_FILE = BASE_DIR / "cron_jobs.json"
+LOG_PATH = BASE_DIR / "cron_sandbox.log"
+
+@dataclass(frozen=True)
+class CronConfig:
+    cron_file: Path = CRON_FILE
+    log_path: Path = LOG_PATH
+EOF
+
+    cat <<'EOF' > "$dir/cron_sandbox.py"
+# cron_sandbox.py
+from __future__ import annotations
+
+import argparse
+import json
+import shlex
+import subprocess
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Iterable, List, Set
+
+import config
+
+
+@dataclass(frozen=True)
+class CronJob:
+    schedule: str
+    command: str
+    description: str
+
+
+def parse_field(field: str, minimum: int, maximum: int) -> Set[int]:
+    values: Set[int] = set()
+    for part in field.split(","):
+        part = part.strip()
+        if part == "*":
+            values.update(range(minimum, maximum + 1))
+        elif part.startswith("*/"):
+            step = int(part[2:])
+            values.update(range(minimum, maximum + 1, step))
+        else:
+            values.add(int(part))
+    return {value for value in values if minimum <= value <= maximum}
+
+
+def parse_schedule(schedule: str) -> Dict[str, Set[int]]:
+    fields = schedule.split()
+    if len(fields) != 5:
+        raise ValueError("Cron schedule must have 5 fields (min hour day month weekday).")
+    return {
+        "minute": parse_field(fields[0], 0, 59),
+        "hour": parse_field(fields[1], 0, 23),
+        "day": parse_field(fields[2], 1, 31),
+        "month": parse_field(fields[3], 1, 12),
+        "weekday": parse_field(fields[4], 0, 6),
+    }
+
+
+def load_jobs(cron_file: Path) -> List[CronJob]:
+    data = json.loads(cron_file.read_text(encoding="utf-8"))
+    jobs = []
+    for entry in data.get("jobs", []):
+        jobs.append(
+            CronJob(
+                schedule=entry["schedule"],
+                command=entry["command"],
+                description=entry.get("description", "No description"),
+            )
+        )
+    return jobs
+
+
+def log_line(message: str, log_path: Path) -> None:
+    timestamp = datetime.utcnow().isoformat()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"[{timestamp}] {message}\n")
+
+
+def should_run(now: datetime, schedule: Dict[str, Set[int]]) -> bool:
+    return (
+        now.minute in schedule["minute"]
+        and now.hour in schedule["hour"]
+        and now.day in schedule["day"]
+        and now.month in schedule["month"]
+        and now.weekday() in schedule["weekday"]
+    )
+
+
+def run_loop(cfg: config.CronConfig) -> None:
+    last_run: Dict[str, str] = {}
+    print("Cron sandbox running. Keeping it tidy and on schedule.")
+    while True:
+        now = datetime.now()
+        stamp = now.strftime("%Y-%m-%d %H:%M")
+        try:
+            jobs = load_jobs(cfg.cron_file)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Can't read cron jobs: {exc}")
+            time.sleep(30)
+            continue
+
+        for job in jobs:
+            schedule = parse_schedule(job.schedule)
+            key = f"{job.command}-{job.schedule}"
+            if should_run(now, schedule) and last_run.get(key) != stamp:
+                last_run[key] = stamp
+                print(f"Running: {job.description}")
+                try:
+                    subprocess.run(shlex.split(job.command), check=False)
+                    log_line(f"Ran: {job.command}", cfg.log_path)
+                except OSError as exc:
+                    log_line(f"Failed: {job.command} ({exc})", cfg.log_path)
+        time.sleep(30)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Local cron sandbox runner.")
+    parser.add_argument("--run", action="store_true", help="Run the cron loop.")
+    return parser
+
+
+def main() -> None:
+    cfg = config.CronConfig()
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.run:
+        run_loop(cfg)
+        return
+    parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
+EOF
+
+    cat <<'EOF' > "$dir/cron_jobs.json"
+{
+  "jobs": [
+    {
+      "schedule": "*/5 * * * *",
+      "command": "python3 -c \"print('Tally ho from the cron sandbox.')\"",
+      "description": "Sample heartbeat job (every 5 minutes)."
+    }
+  ]
+}
+EOF
+}
+
+sandbox_write_venv_templates() {
+    local dir="$1"
+
+    cat <<'EOF' > "$dir/config.py"
+# config.py
+from dataclasses import dataclass
+from pathlib import Path
+
+# Default values chosen for a lightweight venv sandbox.
+BASE_DIR = Path(__file__).resolve().parent
+
+@dataclass(frozen=True)
+class VenvConfig:
+    base_dir: Path = BASE_DIR
+EOF
+
+    cat <<'EOF' > "$dir/main.py"
+# main.py
+from __future__ import annotations
+
+from datetime import datetime
+
+import config
+
+
+def main() -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    print(f"Right then, virtual env sandbox ready at {config.VenvConfig().base_dir}. Time: {now}")
+
+
+if __name__ == "__main__":
+    main()
+EOF
+
+    cat <<'EOF' > "$dir/requirements.txt"
+# requirements.txt
+# Add project dependencies here.
+EOF
+}
+
+sandbox_create() {
+    local sandbox_type="$1"
+    local name="$2"
+    shift 2 || true
+    local auto_venv="$SANDBOX_AUTO_VENV"
+
+    for arg in "$@"; do
+        case "$arg" in
+            --no-venv) auto_venv=0 ;;
+            --venv) auto_venv=1 ;;
+        esac
+    done
+
+    if [ -z "$sandbox_type" ] || [ -z "$name" ]; then
+        echo -e "${YELLOW}Usage: /sandbox create <rag|mcp|cron|venv> <name> [--no-venv]${NC}"
+        return 1
+    fi
+
+    if ! is_valid_sandbox_name "$name"; then
+        echo -e "${RED}✗ Invalid sandbox name. Use letters, numbers, '.', '-' or '_' only.${NC}"
+        return 1
+    fi
+
+    ensure_sandbox_root
+    local dir
+    dir=$(sandbox_dir_for "$name")
+    if [ -d "$dir" ]; then
+        echo -e "${YELLOW}Sandbox already exists: $name${NC}"
+        return 1
+    fi
+
+    mkdir -p "$dir"
+    case "$sandbox_type" in
+        rag)
+            sandbox_write_rag_templates "$dir"
+            ;;
+        mcp)
+            sandbox_write_mcp_templates "$dir"
+            ;;
+        cron)
+            sandbox_write_cron_templates "$dir"
+            ;;
+        venv)
+            sandbox_write_venv_templates "$dir"
+            auto_venv=1
+            ;;
+        *)
+            echo -e "${YELLOW}Unknown sandbox type: $sandbox_type${NC}"
+            rm -rf "$dir"
+            return 1
+            ;;
+    esac
+
+    maybe_create_venv "$dir" "$auto_venv"
+    echo -e "${GREEN}✓ Created ${sandbox_type} sandbox: $name${NC}"
+    echo -e "${GRAY}Path: $dir${NC}"
+}
+
+sandbox_list() {
+    ensure_sandbox_root
+    shopt -s nullglob
+    local entries=("$SANDBOX_ROOT"/*)
+    shopt -u nullglob
+    if [ ${#entries[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No sandboxes found yet.${NC}"
+        return 0
+    fi
+
+    echo -e "${BLUE}🧪 Sandboxes:${NC}"
+    for entry in "${entries[@]}"; do
+        [ -d "$entry" ] || continue
+        echo -e "  ${WHITE}$(basename "$entry")${NC} ${GRAY}(${entry})${NC}"
+    done
+}
+
+sandbox_use() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo -e "${YELLOW}Usage: /sandbox use <name>${NC}"
+        return 1
+    fi
+
+    local dir
+    dir=$(sandbox_dir_for "$name")
+    if [ ! -d "$dir" ]; then
+        echo -e "${RED}✗ Sandbox not found: $name${NC}"
+        return 1
+    fi
+
+    WORK_DIR="$dir"
+    cd "$WORK_DIR" || return 1
+    echo -e "${GREEN}✓ Using sandbox: $name${NC}"
+}
+
+sandbox_info() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo -e "${YELLOW}Usage: /sandbox info <name>${NC}"
+        return 1
+    fi
+
+    local dir
+    dir=$(sandbox_dir_for "$name")
+    if [ ! -d "$dir" ]; then
+        echo -e "${RED}✗ Sandbox not found: $name${NC}"
+        return 1
+    fi
+
+    echo -e "${BLUE}🧪 Sandbox: ${name}${NC}"
+    echo -e "  ${CYAN}Path:${NC} $dir"
+    if [ -d "$dir/.venv" ]; then
+        echo -e "  ${CYAN}Venv:${NC} $dir/.venv"
+    fi
+}
+
+sandbox_delete() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo -e "${YELLOW}Usage: /sandbox delete <name>${NC}"
+        return 1
+    fi
+
+    local dir
+    dir=$(sandbox_dir_for "$name")
+    if [ ! -d "$dir" ]; then
+        echo -e "${RED}✗ Sandbox not found: $name${NC}"
+        return 1
+    fi
+
+    echo -e -n "${YELLOW}Delete sandbox '${name}'? (y/N): ${NC}"
+    local confirm
+    read -r confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${GRAY}Cancelled${NC}"
+        return 1
+    fi
+
+    rm -rf "$dir"
+    echo -e "${GREEN}✓ Deleted sandbox: $name${NC}"
+}
+
+# Session profile helpers
+ensure_profiles_file() {
+    if [ ! -f "$CODY_PROFILES_FILE" ]; then
+        cat <<EOF > "$CODY_PROFILES_FILE"
+# Cody session profiles
+# Each profile is a named section with key=value pairs.
+# Secrets such as OPENROUTER_API_KEY should be stored in .env or environment variables.
+EOF
+    fi
+}
+
+list_profiles() {
+    if [ ! -f "$CODY_PROFILES_FILE" ]; then
+        echo -e "${YELLOW}No profiles found yet.${NC}"
+        return 0
+    fi
+    local profiles
+    profiles=$(awk '/^\[.*\]$/ {gsub(/\[|\]/, "", $0); print $0}' "$CODY_PROFILES_FILE")
+    if [ -z "$profiles" ]; then
+        echo -e "${YELLOW}No profiles found yet.${NC}"
+        return 0
+    fi
+    echo -e "${BLUE}📌 Profiles:${NC}"
+    echo "$profiles" | while IFS= read -r profile; do
+        if [ "$profile" = "$PROFILE_NAME" ]; then
+            echo -e "  ${GREEN}${profile}${NC} ${GRAY}(active)${NC}"
+        else
+            echo -e "  ${WHITE}${profile}${NC}"
+        fi
+    done
+}
+
+save_profile() {
+    local profile="$1"
+    if [ -z "$profile" ]; then
+        echo -e "${YELLOW}Usage: /profile save <name>${NC}"
+        return 1
+    fi
+
+    ensure_profiles_file
+    local tmp_file
+    tmp_file=$(mktemp)
+
+    awk -v profile="$profile" '
+        BEGIN {skip=0}
+        $0 ~ "^\\["profile"\\]$" {skip=1; next}
+        $0 ~ "^\\[" {skip=0}
+        !skip {print}
+    ' "$CODY_PROFILES_FILE" > "$tmp_file"
+
+    {
+        echo ""
+        echo "[$profile]"
+        echo "WORK_DIR=$WORK_DIR"
+        echo "API_PROVIDER=$API_PROVIDER"
+        echo "GEMMA_ENDPOINT=$GEMMA_ENDPOINT"
+        echo "OLLAMA_ENDPOINT=$OLLAMA_ENDPOINT"
+        echo "OPENROUTER_ENDPOINT=$OPENROUTER_ENDPOINT"
+        echo "OPENROUTER_HTTP_REFERER=$OPENROUTER_HTTP_REFERER"
+        echo "OPENROUTER_APP_NAME=$OPENROUTER_APP_NAME"
+        echo "MODEL_NAME=$MODEL_NAME"
+        echo "PROVIDER_NAME=$PROVIDER_NAME"
+        echo "MEMORY_FILE=$MEMORY_FILE"
+    } >> "$tmp_file"
+
+    mv "$tmp_file" "$CODY_PROFILES_FILE"
+    PROFILE_NAME="$profile"
+    echo "$PROFILE_NAME" > "$HOME/.cody_profile"
+    echo -e "${GREEN}✓ Saved profile: $PROFILE_NAME${NC}"
+}
+
+load_profile() {
+    local profile="$1"
+    if [ -z "$profile" ]; then
+        echo -e "${YELLOW}Usage: /profile use <name>${NC}"
+        return 1
+    fi
+    if [ ! -f "$CODY_PROFILES_FILE" ]; then
+        echo -e "${RED}✗ No profiles file found${NC}"
+        return 1
+    fi
+
+    local profile_data
+    profile_data=$(awk -v profile="$profile" '
+        $0 ~ "^\\["profile"\\]$" {in_section=1; next}
+        in_section && $0 ~ "^\\[" {exit}
+        in_section {print}
+    ' "$CODY_PROFILES_FILE")
+
+    if [ -z "$profile_data" ]; then
+        echo -e "${RED}✗ Profile not found: $profile${NC}"
+        return 1
+    fi
+
+    while IFS='=' read -r key value; do
+        key=$(echo "$key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        value=$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        case "$key" in
+            WORK_DIR) WORK_DIR="$value" ;;
+            API_PROVIDER) API_PROVIDER="$value" ;;
+            GEMMA_ENDPOINT) GEMMA_ENDPOINT="$value" ;;
+            OLLAMA_ENDPOINT) OLLAMA_ENDPOINT="$value" ;;
+            OPENROUTER_ENDPOINT) OPENROUTER_ENDPOINT="$value" ;;
+            OPENROUTER_HTTP_REFERER) OPENROUTER_HTTP_REFERER="$value" ;;
+            OPENROUTER_APP_NAME) OPENROUTER_APP_NAME="$value" ;;
+            MODEL_NAME) MODEL_NAME="$value" ;;
+            PROVIDER_NAME) PROVIDER_NAME="$value" ;;
+            MEMORY_FILE) MEMORY_FILE="$value" ;;
+        esac
+    done <<< "$profile_data"
+
+    PROFILE_NAME="$profile"
+    echo "$PROFILE_NAME" > "$HOME/.cody_profile"
+    echo -e "${GREEN}✓ Loaded profile: $PROFILE_NAME${NC}"
+    validate_work_dir
+}
+
+delete_profile() {
+    local profile="$1"
+    if [ -z "$profile" ]; then
+        echo -e "${YELLOW}Usage: /profile delete <name>${NC}"
+        return 1
+    fi
+    if [ ! -f "$CODY_PROFILES_FILE" ]; then
+        echo -e "${RED}✗ No profiles file found${NC}"
+        return 1
+    fi
+    local tmp_file
+    tmp_file=$(mktemp)
+    awk -v profile="$profile" '
+        BEGIN {skip=0}
+        $0 ~ "^\\["profile"\\]$" {skip=1; next}
+        $0 ~ "^\\[" {skip=0}
+        !skip {print}
+    ' "$CODY_PROFILES_FILE" > "$tmp_file"
+    mv "$tmp_file" "$CODY_PROFILES_FILE"
+
+    if [ "$PROFILE_NAME" = "$profile" ]; then
+        PROFILE_NAME=""
+        rm -f "$HOME/.cody_profile"
+    fi
+    echo -e "${GREEN}✓ Deleted profile: $profile${NC}"
+}
+
+show_profile() {
+    local profile="${1:-$PROFILE_NAME}"
+    if [ -z "$profile" ]; then
+        echo -e "${YELLOW}Usage: /profile show <name>${NC}"
+        return 1
+    fi
+    if [ ! -f "$CODY_PROFILES_FILE" ]; then
+        echo -e "${RED}✗ No profiles file found${NC}"
+        return 1
+    fi
+
+    local profile_data
+    profile_data=$(awk -v profile="$profile" '
+        $0 ~ "^\\["profile"\\]$" {in_section=1; next}
+        in_section && $0 ~ "^\\[" {exit}
+        in_section {print}
+    ' "$CODY_PROFILES_FILE")
+
+    if [ -z "$profile_data" ]; then
+        echo -e "${RED}✗ Profile not found: $profile${NC}"
+        return 1
+    fi
+
+    echo -e "${BLUE}📌 Profile: ${profile}${NC}"
+    echo "$profile_data" | while IFS= read -r line; do
+        [ -n "$line" ] && echo -e "  ${GRAY}${line}${NC}"
+    done
+}
+
+load_profile_preference() {
+    if [ -f "$HOME/.cody_profile" ]; then
+        PROFILE_NAME=$(cat "$HOME/.cody_profile")
+        if [ -n "$PROFILE_NAME" ]; then
+            load_profile "$PROFILE_NAME"
+        fi
+    fi
+}
+
+# Command discovery suggestions
+cody_command_suggestions() {
+    local input="$READLINE_LINE"
+    local suggestions=()
+    local prefix="$input"
+    local cmd=""
+    local rest=""
+
+    if [[ "$input" == /* ]]; then
+        cmd="${input%% *}"
+        rest="${input#"$cmd"}"
+        rest="${rest# }"
+        if [[ " ${FILE_COMMANDS[*]} " == *" $cmd "* ]]; then
+            local file_matches=()
+            if [ -d "$WORK_DIR" ]; then
+                while IFS= read -r match; do
+                    [ -f "$WORK_DIR/$match" ] && file_matches+=("$match")
+                done < <(cd "$WORK_DIR" && compgen -f -- "$rest")
+            fi
+            suggestions+=("${file_matches[@]}")
+        else
+            suggestions+=($(compgen -W "${DEFAULT_COMMANDS[*]}" -- "$prefix"))
+        fi
+    else
+        suggestions+=($(compgen -W "${DEFAULT_COMMANDS[*]}" -- "$prefix"))
+    fi
+
+    if [ -f "$HISTORY_FILE" ] && [ -n "$prefix" ]; then
+        local history_matches=()
+        while IFS= read -r line; do
+            if [[ "$line" == "$prefix"* ]]; then
+                history_matches+=("$line")
+            fi
+        done < "$HISTORY_FILE"
+        suggestions+=("${history_matches[@]}")
+    fi
+
+    if [ ${#suggestions[@]} -eq 0 ]; then
+        echo
+        echo -e "${GRAY}No suggestions yet. Try /help for guidance.${NC}"
+        return
+    fi
+
+    declare -A seen
+    local unique=()
+    for suggestion in "${suggestions[@]}"; do
+        if [ -n "$suggestion" ] && [ -z "${seen[$suggestion]}" ]; then
+            unique+=("$suggestion")
+            seen[$suggestion]=1
+        fi
+    done
+
+    echo
+    echo -e "${GRAY}Suggestions:${NC} ${unique[*]}"
+}
+
+# Interactive onboarding wizard
+run_onboarding_wizard() {
+    local env_path="$WORK_DIR/.env"
+    if [ -f "$env_path" ] || [ -f "$HOME/.cody_env" ] || [ -f "$ONBOARDING_FLAG" ]; then
+        return 0
+    fi
+
+    echo -e "${BLUE}🧭 Welcome! Let's set up Cody.${NC}"
+    echo -e "${GRAY}We'll guide you through endpoint, model, and optional profile setup.${NC}"
+    local choice
+    read -r -p "$(echo -e "${GREEN}Run onboarding wizard now? (Y/n): ${NC}")" choice
+    if [[ "$choice" =~ ^[Nn]$ ]]; then
+        echo -e "${YELLOW}Skipping onboarding. You can run /wizard later.${NC}"
+        touch "$ONBOARDING_FLAG"
+        return 0
+    fi
+
+    local provider_choice
+    echo -e "${BLUE}Select your API provider:${NC}"
+    echo -e "  ${YELLOW}1.${NC} LM Studio (default)"
+    echo -e "  ${YELLOW}2.${NC} Ollama"
+    echo -e "  ${YELLOW}3.${NC} OpenRouter"
+    read -r -p "$(echo -e "${GREEN}Choose 1-3 [1]: ${NC}")" provider_choice
+
+    case "$provider_choice" in
+        2)
+            API_PROVIDER="ollama"
+            GEMMA_ENDPOINT="$OLLAMA_ENDPOINT"
+            ;;
+        3)
+            API_PROVIDER="openrouter"
+            GEMMA_ENDPOINT="$OPENROUTER_ENDPOINT"
+            ;;
+        *)
+            API_PROVIDER="lmstudio"
+            GEMMA_ENDPOINT="$GEMMA_ENDPOINT"
+            ;;
+    esac
+
+    local endpoint_input
+    read -r -p "$(echo -e "${GREEN}Endpoint URL [$GEMMA_ENDPOINT]: ${NC}")" endpoint_input
+    if [ -n "$endpoint_input" ]; then
+        GEMMA_ENDPOINT="$endpoint_input"
+    fi
+
+    if [ "$API_PROVIDER" = "openrouter" ]; then
+        echo -e "${YELLOW}Note: Set OPENROUTER_API_KEY in .env or your shell for API access.${NC}"
+        read -r -p "$(echo -e "${GREEN}Model name (e.g. mistralai/codestral-22b-v0.1) [${MODEL_NAME}]: ${NC}")" model_choice
+        if [ -n "$model_choice" ]; then
+            MODEL_NAME="$model_choice"
+        fi
+    else
+        if test_endpoint "$GEMMA_ENDPOINT" "$API_PROVIDER"; then
+            fetch_available_models
+            if [ ${#AVAILABLE_MODELS[@]} -gt 0 ]; then
+                echo -e "${BLUE}Available models:${NC}"
+                local i=1
+                for model in "${AVAILABLE_MODELS[@]}"; do
+                    echo -e "  ${YELLOW}${i}.${NC} $model"
+                    ((i++))
+                done
+                read -r -p "$(echo -e "${GREEN}Select model (1-${#AVAILABLE_MODELS[@]}) [current]: ${NC}")" model_choice
+                if [[ "$model_choice" =~ ^[0-9]+$ ]] && [ "$model_choice" -ge 1 ] && [ "$model_choice" -le ${#AVAILABLE_MODELS[@]} ]; then
+                    MODEL_NAME="${AVAILABLE_MODELS[$((model_choice-1))]}"
+                fi
+            fi
+        else
+            echo -e "${YELLOW}Endpoint validation failed. You can update it later in .env.${NC}"
+        fi
+    fi
+
+    local create_env_choice
+    read -r -p "$(echo -e "${GREEN}Create a project .env file? (Y/n): ${NC}")" create_env_choice
+    if [[ ! "$create_env_choice" =~ ^[Nn]$ ]]; then
+        cat <<EOF > "$env_path"
+# Cody configuration for ${WORK_DIR}
+API_PROVIDER="${API_PROVIDER}"
+MODEL_NAME="${MODEL_NAME}"
+GEMMA_ENDPOINT="${GEMMA_ENDPOINT}"
+OLLAMA_ENDPOINT="${OLLAMA_ENDPOINT}"
+OPENROUTER_ENDPOINT="${OPENROUTER_ENDPOINT}"
+OPENROUTER_APP_NAME="${OPENROUTER_APP_NAME}"
+OPENROUTER_HTTP_REFERER="${OPENROUTER_HTTP_REFERER}"
+EOF
+        echo -e "${GREEN}✓ Created .env at ${env_path}${NC}"
+    fi
+
+    local profile_choice
+    read -r -p "$(echo -e "${GREEN}Save a session profile for this setup? (Y/n): ${NC}")" profile_choice
+    if [[ ! "$profile_choice" =~ ^[Nn]$ ]]; then
+        local default_profile
+        default_profile=$(basename "$WORK_DIR")
+        local profile_name
+        read -r -p "$(echo -e "${GREEN}Profile name [${default_profile}]: ${NC}")" profile_name
+        profile_name="${profile_name:-$default_profile}"
+        MEMORY_FILE="${DEFAULT_PROFILE_MEMORY_DIR}/.cody_memory_${profile_name}"
+        save_profile "$profile_name"
+    fi
+
+    touch "$ONBOARDING_FLAG"
+    echo -e "${GREEN}✓ Onboarding complete. You're ready to go.${NC}"
+}
+
+# Verify work directory exists
+validate_work_dir() {
+    if [ ! -d "$WORK_DIR" ]; then
+        echo -e "${YELLOW}⚠️ WORK_DIR not found: $WORK_DIR${NC}"
+        WORK_DIR="$(pwd)"
+        echo -e "${GREEN}✓ Using current directory: $WORK_DIR${NC}"
+    fi
+}
+
+# Ensure dependencies are available
+ensure_dependencies() {
+    local missing=()
+    command -v curl > /dev/null || missing+=("curl")
+    command -v jq > /dev/null || missing+=("jq")
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo -e "${RED}Missing dependencies: ${missing[*]}${NC}"
+        echo -e "${GRAY}Install with one of:${NC}"
+        echo -e "${GRAY}  apt-get install ${missing[*]}   # Debian/Ubuntu${NC}"
+        echo -e "${GRAY}  brew install ${missing[*]}      # macOS (Homebrew)${NC}"
+        echo -e "${GRAY}  dnf install ${missing[*]}       # Fedora/RHEL${NC}"
+        return 1
+    fi
+}
+
+# Build request headers for API calls
+build_request_headers() {
+    local -n headers_ref=$1
+    headers_ref=("-H" "Content-Type: application/json")
+
+    if [ "$API_PROVIDER" = "openrouter" ]; then
+        if [ -z "$OPENROUTER_API_KEY" ]; then
+            echo -e "${RED}✗ OPENROUTER_API_KEY not set${NC}" >&2
+            return 1
+        fi
+        headers_ref+=("-H" "Authorization: Bearer $OPENROUTER_API_KEY")
+        if [ -n "$OPENROUTER_HTTP_REFERER" ]; then
+            headers_ref+=("-H" "HTTP-Referer: $OPENROUTER_HTTP_REFERER")
+        fi
+        if [ -n "$OPENROUTER_APP_NAME" ]; then
+            headers_ref+=("-H" "X-Title: $OPENROUTER_APP_NAME")
+        fi
+    fi
+}
+
+# Test endpoint connectivity
+test_endpoint() {
+    local endpoint="$1"
+    local provider="${2:-$API_PROVIDER}"
+    local http_code
+    local headers=()
+
+    if [ "$provider" = "openrouter" ]; then
+        if ! build_request_headers headers; then
+            return 1
+        fi
+    fi
+
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        "${headers[@]}" \
+        --connect-timeout "$CONNECT_TIMEOUT" \
+        --max-time "$API_TIMEOUT" \
+        "$endpoint/v1/models" 2>/dev/null)
+
+    if [[ "$http_code" =~ ^2 ]]; then
+        return 0
+    fi
+
+    if [ -z "$http_code" ] || [ "$http_code" = "000" ]; then
+        echo -e "${RED}✗ Cannot connect to $endpoint${NC}"
+    else
+        echo -e "${RED}✗ Endpoint returned HTTP $http_code from $endpoint${NC}"
+    fi
+    return 1
+}
+
 # Manage backup files - keep only MAX_BACKUPS
 manage_backups() {
-    local backup_pattern="$0.backup.*"
-    local backup_files=($(ls -t $backup_pattern 2>/dev/null))
-    
-    if [ ${#backup_files[@]} -gt $MAX_BACKUPS ]; then
+    shopt -s nullglob
+    local backup_files=("$0".backup.*)
+    shopt -u nullglob
+
+    if [ ${#backup_files[@]} -gt "$MAX_BACKUPS" ]; then
         echo -e "${BLUE}Managing backups (keeping $MAX_BACKUPS most recent)${NC}"
-        
-        # Remove oldest backups
-        for ((i=MAX_BACKUPS; i<${#backup_files[@]}; i++)); do
-            echo -e "${GRAY}Removing old backup: ${backup_files[i]##*/}${NC}"
-            rm -f "${backup_files[i]}"
+
+        # Sort by name (timestamps embedded: YYYYMMDD_HHMMSS sorts lexicographically)
+        local sorted_files=()
+        IFS=$'\n' read -r -d '' -a sorted_files < <(printf '%s\n' "${backup_files[@]}" | sort && printf '\0') || true
+
+        local count_to_remove=$(( ${#backup_files[@]} - MAX_BACKUPS ))
+        for ((i=0; i<count_to_remove; i++)); do
+            echo -e "${GRAY}Removing old backup: ${sorted_files[i]##*/}${NC}"
+            rm -f "${sorted_files[i]}"
         done
     fi
 }
@@ -80,33 +1510,79 @@ load_model_preference() {
     fi
 }
 
+# Load saved provider preference
+load_provider_preference() {
+    if [ -f "$HOME/.cody_provider" ]; then
+        PROVIDER_NAME=$(cat "$HOME/.cody_provider")
+    fi
+}
+
 # Fetch available models
 fetch_available_models() {
     AVAILABLE_MODELS=()
-    local resp=$(curl -s "$GEMMA_ENDPOINT/v1/models" 2>/dev/null)
+    local headers=()
+    if ! build_request_headers headers; then
+        return 1
+    fi
+
+    local resp
+    resp=$(curl -s \
+        "${headers[@]}" \
+        --connect-timeout "$CONNECT_TIMEOUT" \
+        --max-time "$API_TIMEOUT" \
+        "$GEMMA_ENDPOINT/v1/models" 2>/dev/null)
     if [ -n "$resp" ]; then
-        mapfile -t AVAILABLE_MODELS < <(echo "$resp" | jq -r '..|.id? // empty' | sort -u)
+        if [ "$API_PROVIDER" = "openrouter" ]; then
+            mapfile -t AVAILABLE_MODELS < <(echo "$resp" | jq -r '.data[].id // empty' | sort -u)
+        else
+            mapfile -t AVAILABLE_MODELS < <(echo "$resp" | jq -r '..|.id? // empty' | sort -u)
+        fi
     fi
 }
 
 # Detect Ollama
 detect_ollama() {
-    curl -s "$OLLAMA_ENDPOINT/v1/models" >/dev/null 2>&1
+    curl -s \
+        --connect-timeout "$CONNECT_TIMEOUT" \
+        --max-time "$API_TIMEOUT" \
+        "$OLLAMA_ENDPOINT/v1/models" >/dev/null 2>&1
 }
 
 # Select endpoint
 select_endpoint() {
     local endpoints=("$GEMMA_ENDPOINT")
     local names=("LM Studio ($GEMMA_ENDPOINT)")
+    local providers=("lmstudio")
 
     if detect_ollama; then
         endpoints+=("$OLLAMA_ENDPOINT")
         names+=("Ollama ($OLLAMA_ENDPOINT)")
+        providers+=("ollama")
+    fi
+
+    if [ -n "$OPENROUTER_API_KEY" ]; then
+        endpoints+=("$OPENROUTER_ENDPOINT")
+        names+=("OpenRouter ($OPENROUTER_ENDPOINT)")
+        providers+=("openrouter")
     fi
 
     # Check if we're in non-interactive mode
     if [ ! -t 0 ]; then
-        # Non-interactive mode: use default endpoint
+        case "$API_PROVIDER" in
+            openrouter)
+                if [ -z "$OPENROUTER_API_KEY" ]; then
+                    echo -e "${RED}✗ OPENROUTER_API_KEY not set${NC}"
+                    return 1
+                fi
+                GEMMA_ENDPOINT="$OPENROUTER_ENDPOINT"
+                ;;
+            ollama)
+                GEMMA_ENDPOINT="$OLLAMA_ENDPOINT"
+                ;;
+            *)
+                API_PROVIDER="lmstudio"
+                ;;
+        esac
         echo -e "${GREEN}✓ Using endpoint: $GEMMA_ENDPOINT${NC}"
         return
     fi
@@ -124,6 +1600,7 @@ select_endpoint() {
         read -e -p "$(echo -e "${GREEN}Select server (1-${#endpoints[@]}) or Enter for default [1]: ${NC}")" choice
         if [[ $choice =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#endpoints[@]} ]; then
             GEMMA_ENDPOINT="${endpoints[$((choice-1))]}"
+            API_PROVIDER="${providers[$((choice-1))]}"
         fi
     fi
 
@@ -137,6 +1614,7 @@ setup_readline() {
 
     # Bind ESC to a custom handler that sets a flag
     bind '"\e": " \C-u__CODY_ESC__\n"'
+    bind -x '"\t": cody_command_suggestions'
 
     if [ -f "$HISTORY_FILE" ]; then
         while IFS= read -r line; do
@@ -209,6 +1687,28 @@ select_model() {
     fi
 }
 
+# Provider selection (OpenRouter)
+select_provider() {
+    if [ "$API_PROVIDER" != "openrouter" ]; then
+        echo -e "${YELLOW}Provider selection is only available with OpenRouter${NC}"
+        return 1
+    fi
+
+    local current_provider="${PROVIDER_NAME:-auto}"
+    local choice
+    read -e -p "$(echo -e "${GREEN}Enter provider name or press Enter for auto [${current_provider}]: ${NC}")" choice
+
+    if [ -z "$choice" ]; then
+        PROVIDER_NAME=""
+        rm -f "$HOME/.cody_provider"
+        echo -e "${GREEN}✓ Provider set to auto${NC}"
+    else
+        PROVIDER_NAME="$choice"
+        echo "$PROVIDER_NAME" > "$HOME/.cody_provider"
+        echo -e "${GREEN}✓ Provider set to: $PROVIDER_NAME${NC}"
+    fi
+}
+
 # Header with proper word wrapping
 print_header() {
     clear
@@ -255,11 +1755,26 @@ print_header() {
     echo -e "  ${BLUE}/fix${NC} <filename> <issue>           ${GRAY}Fix code${NC}"
     echo -e "  ${BLUE}/files${NC}                            ${GRAY}List files${NC}"
     echo -e "  ${BLUE}/exec${NC} <command>                   ${GRAY}Execute shell command${NC}"
+    echo -e "  ${BLUE}/pip${NC} <args> | ${BLUE}/npm${NC} <args> | ${BLUE}/pnpm${NC} <args> | ${BLUE}/yarn${NC} <args> | ${BLUE}/crush${NC} <args>"
     echo -e "  ${BLUE}/selfmod${NC} <description>            ${GRAY}Modify myself${NC}"
     echo -e "  ${BLUE}/reload${NC}                           ${GRAY}Reload system prompt${NC}"
-    echo -e "  ${BLUE}/model${NC} | ${BLUE}/clear${NC} | ${BLUE}/help${NC} | ${BLUE}/exit${NC}"
+    echo -e "  ${BLUE}/status${NC}                           ${GRAY}Show endpoint status${NC}"
+    echo -e "  ${BLUE}/doctor${NC}                           ${GRAY}Run diagnostics${NC}"
+    echo -e "  ${BLUE}/profile${NC}                          ${GRAY}Manage session profiles${NC}"
+    echo -e "  ${BLUE}/agent${NC}                            ${GRAY}Manage and spawn agents${NC}"
+    echo -e "  ${BLUE}/sandbox${NC}                          ${GRAY}Manage RAG/MCP/venv/cron sandboxes${NC}"
+    echo -e "  ${BLUE}/wizard${NC}                           ${GRAY}Run onboarding wizard${NC}"
+    echo -e "  ${BLUE}/model${NC} | ${BLUE}/provider${NC} | ${BLUE}/clear${NC} | ${BLUE}/help${NC} | ${BLUE}/exit${NC}"
+    echo -e "${GRAY}Tip: Press Tab for contextual suggestions. Use /help <query> to search.${NC}"
     echo
     echo -e "${CYAN}Model:${NC} ${MODEL_NAME}"
+    if [ "$API_PROVIDER" = "openrouter" ]; then
+        local provider_label="${PROVIDER_NAME:-auto}"
+        echo -e "${CYAN}Provider:${NC} ${provider_label}"
+    fi
+    if [ -n "$PROFILE_NAME" ]; then
+        echo -e "${CYAN}Profile:${NC} ${PROFILE_NAME}"
+    fi
     echo -e "${CYAN}Directory:${NC} ${WORK_DIR}"
     echo -e "${CYAN}Streaming:${NC} ${STREAM_OUTPUT} (set STREAM_OUTPUT=1 to enable)"
     
@@ -292,6 +1807,101 @@ print_header() {
     echo
 }
 
+# Help display (grouped + searchable)
+print_help() {
+    local query="$1"
+    local -a sections=(
+        "Creation & Editing"
+        "Execution & Tools"
+        "AI Assistance"
+        "Agents"
+        "Sandboxing"
+        "Configuration & Profiles"
+        "Navigation"
+    )
+
+    local -a items_creation=(
+        "/create <filename> <description> - Create a new file"
+        "/edit <filename> - Edit a file"
+        "/files [--no-dotfiles|--sources] - List files"
+    )
+    local -a items_execution=(
+        "/run <filename> - Run a file"
+        "/exec <command> - Execute shell command"
+        "/pip <args> - Run pip"
+        "/npm <args> - Run npm"
+        "/pnpm <args> - Run pnpm"
+        "/yarn <args> - Run yarn"
+        "/crush <args> - Run Charmbracelet Crush"
+    )
+    local -a items_ai=(
+        "/explain <filename> - Explain code"
+        "/fix <filename> <issue> - Fix code"
+        "/selfmod <description> - Modify Cody"
+    )
+    local -a items_agents=(
+        "/agent list - List agents"
+        "/agent create <name> <system prompt> - Create an agent"
+        "/agent show <name> - Show agent configuration"
+        "/agent spawn <name> <task> - Spawn agent in a subprocess"
+        "/agent stop <name> [--force] - Stop a running agent"
+        "/agent logs <name> - Tail agent logs"
+        "/agent delete <name> - Delete an agent"
+    )
+    local -a items_sandbox=(
+        "/sandbox list - List sandboxes"
+        "/sandbox create <rag|mcp|cron|venv> <name> [--no-venv] - Create a sandbox"
+        "/sandbox use <name> - Use a sandbox as the working directory"
+        "/sandbox info <name> - Show sandbox details"
+        "/sandbox delete <name> - Delete a sandbox"
+    )
+    local -a items_config=(
+        "/model - Select model"
+        "/provider - Select OpenRouter provider"
+        "/status - Show endpoint status"
+        "/doctor - Run diagnostics"
+        "/reload - Reload system prompt"
+        "/profile list|use|save|delete|show - Manage session profiles"
+        "/wizard - Run onboarding wizard"
+    )
+    local -a items_nav=(
+        "/help [query] - Show help or search commands"
+        "/clear - Clear memory"
+        "/exit - Exit Cody"
+    )
+
+    echo -e "${BLUE}📘 Help${NC}"
+    if [ -n "$query" ]; then
+        echo -e "${GRAY}Searching for: ${query}${NC}"
+        printf "%s\n" \
+            "${items_creation[@]}" \
+            "${items_execution[@]}" \
+            "${items_ai[@]}" \
+            "${items_agents[@]}" \
+            "${items_sandbox[@]}" \
+            "${items_config[@]}" \
+            "${items_nav[@]}" | grep -i "$query" | while IFS= read -r line; do
+                echo -e "  ${WHITE}${line}${NC}"
+            done
+        return 0
+    fi
+
+    echo -e "${CYAN}${sections[0]}${NC}"
+    for line in "${items_creation[@]}"; do echo -e "  ${WHITE}${line}${NC}"; done
+    echo -e "${CYAN}${sections[1]}${NC}"
+    for line in "${items_execution[@]}"; do echo -e "  ${WHITE}${line}${NC}"; done
+    echo -e "${CYAN}${sections[2]}${NC}"
+    for line in "${items_ai[@]}"; do echo -e "  ${WHITE}${line}${NC}"; done
+    echo -e "${CYAN}${sections[3]}${NC}"
+    for line in "${items_agents[@]}"; do echo -e "  ${WHITE}${line}${NC}"; done
+    echo -e "${CYAN}${sections[4]}${NC}"
+    for line in "${items_sandbox[@]}"; do echo -e "  ${WHITE}${line}${NC}"; done
+    echo -e "${CYAN}${sections[5]}${NC}"
+    for line in "${items_config[@]}"; do echo -e "  ${WHITE}${line}${NC}"; done
+    echo -e "${CYAN}${sections[6]}${NC}"
+    for line in "${items_nav[@]}"; do echo -e "  ${WHITE}${line}${NC}"; done
+}
+
 # Typing animation
 show_typing() {
     local message="$1"
@@ -305,26 +1915,26 @@ show_typing() {
 
 # Project context
 get_project_context() {
-    local context="Project: $WORK_DIR
-"
-    local file_count=0
-    cd "$WORK_DIR" || return
-    shopt -s nullglob
-    for file in *; do
-        if [ -f "$file" ] && [[ ! "$file" =~ ^cody ]] && [ ${#file} -lt 50 ]; then
-            local lines=$(wc -l < "$file" 2>/dev/null || echo "0")
-            if [ "$lines" -lt 200 ]; then
-                context="$context- $file ($lines lines)
-"
-                ((file_count++))
+    # Run in a subshell to avoid mutating the caller's working directory
+    (
+        cd "$WORK_DIR" || exit 0
+        local context="Project: $WORK_DIR\n"
+        local file_count=0
+        shopt -s nullglob
+        for file in *; do
+            if [ -f "$file" ] && [[ ! "$file" =~ ^cody ]] && [ ${#file} -lt 50 ]; then
+                local lines
+                lines=$(wc -l < "$file" 2>/dev/null || echo "0")
+                if [ "$lines" -lt 200 ]; then
+                    context="$context- $file ($lines lines)\n"
+                    ((file_count++))
+                fi
             fi
-        fi
-    done
-    shopt -u nullglob
-    context="$context
-Files: $file_count
-"
-    echo -e "$context"
+        done
+        shopt -u nullglob
+        context="${context}\nFiles: $file_count\n"
+        echo -e "$context"
+    )
 }
 
 # AI API call with system prompt
@@ -342,32 +1952,55 @@ User: $prompt"
     local escaped_system=$(echo "$custom_system_prompt" | jq -Rs .)
     
     local messages="[{\"role\": \"system\", \"content\": $escaped_system}, {\"role\": \"user\", \"content\": $escaped_prompt}]"
-    
-    if [ "$STREAM_OUTPUT" = "1" ]; then
-        curl -s -N -X POST "$GEMMA_ENDPOINT/v1/chat/completions" \
-            -H "Content-Type: application/json" \
-            -d "{\n                \"model\": \"$MODEL_NAME\",\n                \"messages\": $messages,\n                \"temperature\": $temperature,\n                \"max_tokens\": 4000,\n                \"stream\": true\n            }" 2>/dev/null | \
-        while IFS= read -r line; do
-            [[ $line == "data: "* ]] || continue
-            local chunk=${line#data: }
-            [ "$chunk" = "[DONE]" ] && break
-            echo -n "$(echo "$chunk" | jq -r -c '.choices[0].delta.content // empty')"
-        done
-        echo
-    else
-        local response=$(curl -s -X POST "$GEMMA_ENDPOINT/v1/chat/completions" \
-            -H "Content-Type: application/json" \
-            -d "{\n                \"model\": \"$MODEL_NAME\",\n                \"messages\": $messages,\n                \"temperature\": $temperature,\n                \"max_tokens\": 4000\n            }" 2>/dev/null)
 
-        if [ -n "$response" ]; then
-            local error=$(echo "$response" | jq -r '.error.message // empty' 2>/dev/null)
-            if [ -n "$error" ]; then
-                echo -e "${RED}API Error: $error${NC}" >&2
-                return 1
+    local headers=()
+    if ! build_request_headers headers; then
+        return 1
+    fi
+
+    # Build JSON payload with jq so model/provider names with special chars are safe
+    local payload
+    payload=$(jq -n \
+        --arg model "$MODEL_NAME" \
+        --argjson messages "$messages" \
+        --argjson temp "$temperature" \
+        '{model: $model, messages: $messages, temperature: $temp, max_tokens: 4000}')
+
+    if [ "$API_PROVIDER" = "openrouter" ] && [ -n "$PROVIDER_NAME" ]; then
+        payload=$(echo "$payload" | jq --arg provider "$PROVIDER_NAME" \
+            '. + {provider: {order: [$provider], allow_fallbacks: true}}')
+    fi
+
+    local response
+    response=$(curl -s -w "\n%{http_code}" -X POST "$GEMMA_ENDPOINT/v1/chat/completions" \
+        "${headers[@]}" \
+        --connect-timeout "$CONNECT_TIMEOUT" \
+        --max-time "$API_TIMEOUT" \
+        -d "$payload" 2>/dev/null)
+
+    if [ -n "$response" ]; then
+        local http_code=$(echo "$response" | tail -n 1)
+        local body=$(echo "$response" | sed '$d')
+
+        if [[ ! "$http_code" =~ ^2 ]]; then
+            if [ -z "$http_code" ] || [ "$http_code" = "000" ]; then
+                echo -e "${RED}API Error: Connection failed${NC}" >&2
+            else
+                echo -e "${RED}API Error: HTTP $http_code${NC}" >&2
             fi
-
-            echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null
+            return 1
         fi
+
+        local error=$(echo "$body" | jq -r '.error.message // empty' 2>/dev/null)
+        if [ -n "$error" ]; then
+            echo -e "${RED}API Error: $error${NC}" >&2
+            return 1
+        fi
+        
+        echo "$body" | jq -r '.choices[0].message.content // empty' 2>/dev/null
+    else
+        echo -e "${RED}API Error: Empty response${NC}" >&2
+        return 1
     fi
 }
 
@@ -442,6 +2075,91 @@ execute_command() {
     return $exit_code
 }
 
+# PACKAGE MANAGER HELPERS
+run_pip_command() {
+    local args="$1"
+    local pip_cmd=""
+
+    if command -v python3 > /dev/null; then
+        pip_cmd="python3 -m pip"
+    elif command -v pip3 > /dev/null; then
+        pip_cmd="pip3"
+    elif command -v pip > /dev/null; then
+        pip_cmd="pip"
+    else
+        echo -e "${RED}✗ pip not available${NC}"
+        return 1
+    fi
+
+    if [ -z "$args" ]; then
+        echo -e "${YELLOW}Usage: /pip <args>${NC}"
+        return 1
+    fi
+
+    execute_command "$pip_cmd $args"
+}
+
+run_npm_command() {
+    local args="$1"
+    if ! command -v npm > /dev/null; then
+        echo -e "${RED}✗ npm not available${NC}"
+        return 1
+    fi
+
+    if [ -z "$args" ]; then
+        echo -e "${YELLOW}Usage: /npm <args>${NC}"
+        return 1
+    fi
+
+    execute_command "npm $args"
+}
+
+run_pnpm_command() {
+    local args="$1"
+    if ! command -v pnpm > /dev/null; then
+        echo -e "${RED}✗ pnpm not available${NC}"
+        return 1
+    fi
+
+    if [ -z "$args" ]; then
+        echo -e "${YELLOW}Usage: /pnpm <args>${NC}"
+        return 1
+    fi
+
+    execute_command "pnpm $args"
+}
+
+run_yarn_command() {
+    local args="$1"
+    if ! command -v yarn > /dev/null; then
+        echo -e "${RED}✗ yarn not available${NC}"
+        return 1
+    fi
+
+    if [ -z "$args" ]; then
+        echo -e "${YELLOW}Usage: /yarn <args>${NC}"
+        return 1
+    fi
+
+    execute_command "yarn $args"
+}
+
+run_crush_command() {
+    local args="$1"
+    if ! command -v crush > /dev/null; then
+        echo -e "${RED}✗ crush not available${NC}"
+        echo -e "${GRAY}Install from https://github.com/charmbracelet/crush and ensure it's on your PATH.${NC}"
+        return 1
+    fi
+
+    if [ -z "$args" ]; then
+        echo -e "${YELLOW}Usage: /crush <args>${NC}"
+        return 1
+    fi
+
+    execute_command "crush $args"
+}
+
 # SELF-MODIFICATION ENGINE
 modify_self() {
     local description="$1"
@@ -497,7 +2215,7 @@ modify_self() {
 is_action_request() {
     local input="$1"
     
-    [[ "$input" =~ ^(rename|move|mv|create|make|delete|remove|copy|cp|chmod|mkdir|run|execute|test|check|verify|try|git|add.*myself|modify.*myself|improve.*myself|apply.*upgrade|implement.*plan) ]]
+    [[ "$input" =~ ^(rename|move|mv|create|make|delete|remove|copy|cp|chmod|mkdir|run|execute|test|check|verify|try|git|pip|pip3|python[[:space:]]+-m[[:space:]]+pip|npm|pnpm|yarn|crush|add.*myself|modify.*myself|improve.*myself|apply.*upgrade|implement.*plan) ]]
 }
 
 # ACTION EXECUTOR
@@ -556,6 +2274,35 @@ execute_action() {
             ;;
         *"myself"*|*"yourself"*|*"upgrade"*|*"implement"*)
             modify_self "$input"
+            return 0
+            ;;
+        pip\ *)
+            run_pip_command "${input#pip }"
+            return 0
+            ;;
+        pip3\ *)
+            run_pip_command "${input#pip3 }"
+            return 0
+            ;;
+        python\ -m\ pip\ *)
+            local pip_args="${input#python -m pip }"
+            run_pip_command "$pip_args"
+            return 0
+            ;;
+        npm\ *)
+            run_npm_command "${input#npm }"
+            return 0
+            ;;
+        pnpm\ *)
+            run_pnpm_command "${input#pnpm }"
+            return 0
+            ;;
+        yarn\ *)
+            run_yarn_command "${input#yarn }"
+            return 0
+            ;;
+        crush\ *)
+            run_crush_command "${input#crush }"
             return 0
             ;;
         *"git "*)
@@ -660,27 +2407,38 @@ handle_run() {
     # Remove any trailing whitespace from filename
     filename=$(echo "$filename" | sed 's/[[:space:]]*$//')
     local target="$filename"
-    
+
+    # Try WORK_DIR as a fallback if the file isn't found in CWD
+    if [ ! -f "$target" ] && [ -f "$WORK_DIR/$filename" ]; then
+        target="$WORK_DIR/$filename"
+    fi
+
     if [ ! -f "$target" ]; then
         echo -e "${RED}✗ File not found: $filename${NC}"
         return 1
     fi
-    
-    echo -e "${BLUE}${ROCKET_ICON} Running $filename...${NC}"
+
+    echo -e "${BLUE}${ROCKET_ICON} Running $target...${NC}"
     echo -e "${GRAY}────────────────────────────────────────${NC}"
-    
-    # Already in current directory, no need to change
-    case "$filename" in
-        *.py) python3 "$filename" || python "$filename" ;;
-        *.js) node "$filename" ;;
-        *.sh) bash "$filename" ;;
-        *.rb) ruby "$filename" ;;
-        *.go) go run "$filename" ;;
-        *) echo -e "${YELLOW}Unknown file type: $filename${NC}" ;;
+
+    local exit_code=0
+    case "$target" in
+        *.py) python3 "$target" || python "$target"; exit_code=$? ;;
+        *.js) node "$target"; exit_code=$? ;;
+        *.ts) npx --yes ts-node "$target" 2>/dev/null || node --experimental-strip-types "$target" 2>/dev/null || { echo -e "${YELLOW}ts-node not found; install with: npm i -g ts-node typescript${NC}"; exit_code=1; } ;;
+        *.sh) bash "$target"; exit_code=$? ;;
+        *.rb) ruby "$target"; exit_code=$? ;;
+        *.go) go run "$target"; exit_code=$? ;;
+        *) echo -e "${YELLOW}Unknown file type: $target${NC}"; exit_code=1 ;;
     esac
-    
+
     echo -e "${GRAY}────────────────────────────────────────${NC}"
-    echo -e "${GREEN}✓ Finished${NC}"
+    if [ "$exit_code" -eq 0 ]; then
+        echo -e "${GREEN}✓ Finished${NC}"
+    else
+        echo -e "${RED}✗ Finished with exit code: $exit_code${NC}"
+    fi
+    return "$exit_code"
 }
 
 handle_explain() {
@@ -803,6 +2561,108 @@ handle_files() {
     fi
 }
 
+handle_status() {
+    echo -e "${BLUE}📡 Status${NC}"
+    echo -e "${CYAN}Model:${NC} ${MODEL_NAME}"
+    if [ "$API_PROVIDER" = "openrouter" ]; then
+        local provider_label="${PROVIDER_NAME:-auto}"
+        echo -e "${CYAN}Provider:${NC} ${provider_label}"
+    fi
+    if [ -n "$PROFILE_NAME" ]; then
+        echo -e "${CYAN}Profile:${NC} ${PROFILE_NAME}"
+    fi
+    echo -e "${CYAN}Directory:${NC} ${WORK_DIR}"
+    echo -e "${CYAN}Endpoint:${NC} ${GEMMA_ENDPOINT}"
+    if test_endpoint "$GEMMA_ENDPOINT" "$API_PROVIDER"; then
+        echo -e "${GREEN}✓ Endpoint reachable${NC}"
+    else
+        echo -e "${RED}✗ Endpoint unreachable${NC}"
+    fi
+}
+
+handle_doctor() {
+    echo -e "${BLUE}🩺 Diagnostics${NC}"
+
+    local issues=0
+    local warnings=0
+    local missing=()
+
+    command -v curl > /dev/null || missing+=("curl")
+    command -v jq > /dev/null || missing+=("jq")
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo -e "${RED}✗ Missing dependencies: ${missing[*]}${NC}"
+        issues=$((issues + 1))
+    else
+        echo -e "${GREEN}✓ Dependencies available (curl, jq)${NC}"
+    fi
+
+    if [ -d "$WORK_DIR" ]; then
+        echo -e "${GREEN}✓ Working directory: $WORK_DIR${NC}"
+    else
+        echo -e "${RED}✗ WORK_DIR not found: $WORK_DIR${NC}"
+        issues=$((issues + 1))
+    fi
+
+    if [ -f "$WORK_DIR/.env" ]; then
+        echo -e "${GREEN}✓ Project .env detected${NC}"
+    elif [ -f "$HOME/.cody_env" ]; then
+        echo -e "${GREEN}✓ User .cody_env detected${NC}"
+    else
+        echo -e "${YELLOW}⚠️  No .env or ~/.cody_env found${NC}"
+        warnings=$((warnings + 1))
+    fi
+
+    if [ "$API_PROVIDER" = "openrouter" ]; then
+        if [ -n "$OPENROUTER_API_KEY" ]; then
+            echo -e "${GREEN}✓ OpenRouter API key configured${NC}"
+        else
+            echo -e "${RED}✗ OPENROUTER_API_KEY not set${NC}"
+            issues=$((issues + 1))
+        fi
+        local provider_label="${PROVIDER_NAME:-auto}"
+        echo -e "${CYAN}Provider:${NC} ${provider_label}"
+    fi
+
+    if test_endpoint "$GEMMA_ENDPOINT" "$API_PROVIDER"; then
+        echo -e "${GREEN}✓ Endpoint reachable: $GEMMA_ENDPOINT${NC}"
+    else
+        echo -e "${RED}✗ Endpoint unreachable: $GEMMA_ENDPOINT${NC}"
+        issues=$((issues + 1))
+    fi
+
+    if [ -n "$MEMORY_FILE" ]; then
+        local memory_dir
+        memory_dir=$(dirname "$MEMORY_FILE")
+        if [ -e "$MEMORY_FILE" ]; then
+            if [ -w "$MEMORY_FILE" ]; then
+                echo -e "${GREEN}✓ Memory file writable: $MEMORY_FILE${NC}"
+            else
+                echo -e "${RED}✗ Memory file not writable: $MEMORY_FILE${NC}"
+                issues=$((issues + 1))
+            fi
+        elif [ -d "$memory_dir" ] && [ -w "$memory_dir" ]; then
+            echo -e "${GREEN}✓ Memory file directory writable: $memory_dir${NC}"
+        else
+            echo -e "${RED}✗ Memory file directory not writable: $memory_dir${NC}"
+            issues=$((issues + 1))
+        fi
+    fi
+
+    if [ "$issues" -eq 0 ] && [ "$warnings" -eq 0 ]; then
+        echo -e "${GREEN}✓ Diagnostics passed${NC}"
+        return 0
+    fi
+
+    if [ "$issues" -eq 0 ]; then
+        echo -e "${YELLOW}⚠️  Diagnostics completed with ${warnings} warning(s)${NC}"
+        return 0
+    fi
+
+    echo -e "${RED}✗ Diagnostics found ${issues} issue(s)${NC}"
+    return 1
+}
+
 handle_chat() {
     local input="$1"
     
@@ -824,6 +2684,93 @@ handle_chat() {
             echo -e "${RED}✗ No response${NC}"
         fi
     fi
+}
+
+handle_profile() {
+    local action="$1"
+    shift || true
+    case "$action" in
+        list|"")
+            list_profiles
+            ;;
+        use)
+            load_profile "$1"
+            ;;
+        save)
+            save_profile "$1"
+            ;;
+        delete)
+            delete_profile "$1"
+            ;;
+        show)
+            show_profile "$1"
+            ;;
+        *)
+            echo -e "${YELLOW}Usage: /profile list|use|save|delete|show [name]${NC}"
+            ;;
+    esac
+}
+
+handle_agent() {
+    local action="$1"
+    shift || true
+    case "$action" in
+        list|"")
+            agent_list
+            ;;
+        create)
+            local name="$1"
+            shift || true
+            agent_create "$name" "$*"
+            ;;
+        show)
+            agent_show "$1"
+            ;;
+        spawn)
+            local name="$1"
+            shift || true
+            agent_spawn "$name" "$*"
+            ;;
+        stop)
+            local name="$1"
+            shift || true
+            agent_stop "$name" "$1"
+            ;;
+        logs)
+            agent_logs "$1"
+            ;;
+        delete)
+            agent_delete "$1"
+            ;;
+        *)
+            echo -e "${YELLOW}Usage: /agent list|create|show|spawn|stop|logs|delete${NC}"
+            ;;
+    esac
+}
+
+handle_sandbox() {
+    local action="$1"
+    shift || true
+    case "$action" in
+        list|"")
+            sandbox_list
+            ;;
+        create)
+            sandbox_create "$@"
+            ;;
+        use)
+            sandbox_use "$1"
+            ;;
+        info)
+            sandbox_info "$1"
+            ;;
+        delete)
+            sandbox_delete "$1"
+            ;;
+        *)
+            echo -e "${YELLOW}Usage: /sandbox list|create|use|info|delete${NC}"
+            ;;
+    esac
 }
 
 # MAIN INPUT PARSER
@@ -857,17 +2804,29 @@ parse_input() {
                 handle_files $args
                 ;;
             "exec") execute_command "$args" ;;
+            "pip") run_pip_command "$args" ;;
+            "npm") run_npm_command "$args" ;;
+            "pnpm") run_pnpm_command "$args" ;;
+            "yarn") run_yarn_command "$args" ;;
+            "crush") run_crush_command "$args" ;;
             "selfmod") modify_self "$args" ;;
             "model") select_model ;;
+            "provider") select_provider ;;
+            "status") handle_status ;;
+            "doctor") handle_doctor ;;
             "reload")
                 load_system_prompt
                 echo -e "${GREEN}✓ System prompt reloaded${NC}"
                 ;;
+            "profile") handle_profile $args ;;
+            "agent") handle_agent $args ;;
+            "sandbox") handle_sandbox $args ;;
+            "wizard") run_onboarding_wizard ;;
             "clear")
                 > "$MEMORY_FILE"
                 echo -e "${YELLOW}✓ Cleared${NC}"
                 ;;
-            "help") print_header ;;
+            "help") print_help "$args" ;;
             "exit"|"quit")
                 echo -e "${YELLOW}${ROCKET_ICON} Goodbye!${NC}"
                 exit 0
@@ -924,18 +2883,19 @@ main() {
 # Check if we're running non-interactively (piped input)
 if [ ! -t 0 ]; then
     # Non-interactive mode: minimal startup
-    if ! command -v curl > /dev/null || ! command -v jq > /dev/null; then
-        echo -e "${RED}Missing: curl and/or jq${NC}"
+    if ! ensure_dependencies; then
         exit 1
     fi
     
     load_model_preference
+    load_provider_preference
+    load_profile_preference
     load_system_prompt
+    validate_work_dir
     select_endpoint
     
     # Quick connection test
-    if ! curl -s "$GEMMA_ENDPOINT/v1/models" > /dev/null; then
-        echo -e "${RED}✗ Cannot connect to $GEMMA_ENDPOINT${NC}"
+    if ! test_endpoint "$GEMMA_ENDPOINT" "$API_PROVIDER"; then
         exit 1
     fi
     
@@ -946,19 +2906,21 @@ else
     echo -e "${GRAY}Initializing...${NC}"
 
     # Check dependencies
-    if ! command -v curl > /dev/null || ! command -v jq > /dev/null; then
-        echo -e "${RED}Missing: curl and/or jq${NC}"
+    if ! ensure_dependencies; then
         exit 1
     fi
 
     # Load configuration
     load_model_preference
+    load_provider_preference
+    load_profile_preference
     load_system_prompt
+    validate_work_dir
+    run_onboarding_wizard
     select_endpoint
 
     echo -e "${BLUE}Testing connection...${NC}"
-    if ! curl -s "$GEMMA_ENDPOINT/v1/models" > /dev/null; then
-        echo -e "${RED}✗ Cannot connect to $GEMMA_ENDPOINT${NC}"
+    if ! test_endpoint "$GEMMA_ENDPOINT" "$API_PROVIDER"; then
         exit 1
     fi
 
