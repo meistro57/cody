@@ -359,6 +359,7 @@ agent_stop() {
     pid=$(cat "$pid_file")
     if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
         echo -e "${YELLOW}⚠️  Agent already stopped: $name${NC}"
+        rm -f "$pid_file"
         return 0
     fi
 
@@ -1422,6 +1423,10 @@ ensure_dependencies() {
 
     if [ ${#missing[@]} -gt 0 ]; then
         echo -e "${RED}Missing dependencies: ${missing[*]}${NC}"
+        echo -e "${GRAY}Install with one of:${NC}"
+        echo -e "${GRAY}  apt-get install ${missing[*]}   # Debian/Ubuntu${NC}"
+        echo -e "${GRAY}  brew install ${missing[*]}      # macOS (Homebrew)${NC}"
+        echo -e "${GRAY}  dnf install ${missing[*]}       # Fedora/RHEL${NC}"
         return 1
     fi
 }
@@ -1479,16 +1484,21 @@ test_endpoint() {
 
 # Manage backup files - keep only MAX_BACKUPS
 manage_backups() {
-    local backup_pattern="$0.backup.*"
-    local backup_files=($(ls -t $backup_pattern 2>/dev/null))
-    
-    if [ ${#backup_files[@]} -gt $MAX_BACKUPS ]; then
+    shopt -s nullglob
+    local backup_files=("$0".backup.*)
+    shopt -u nullglob
+
+    if [ ${#backup_files[@]} -gt "$MAX_BACKUPS" ]; then
         echo -e "${BLUE}Managing backups (keeping $MAX_BACKUPS most recent)${NC}"
-        
-        # Remove oldest backups
-        for ((i=MAX_BACKUPS; i<${#backup_files[@]}; i++)); do
-            echo -e "${GRAY}Removing old backup: ${backup_files[i]##*/}${NC}"
-            rm -f "${backup_files[i]}"
+
+        # Sort by name (timestamps embedded: YYYYMMDD_HHMMSS sorts lexicographically)
+        local sorted_files=()
+        IFS=$'\n' read -r -d '' -a sorted_files < <(printf '%s\n' "${backup_files[@]}" | sort && printf '\0') || true
+
+        local count_to_remove=$(( ${#backup_files[@]} - MAX_BACKUPS ))
+        for ((i=0; i<count_to_remove; i++)); do
+            echo -e "${GRAY}Removing old backup: ${sorted_files[i]##*/}${NC}"
+            rm -f "${sorted_files[i]}"
         done
     fi
 }
@@ -1515,7 +1525,8 @@ fetch_available_models() {
         return 1
     fi
 
-    local resp=$(curl -s \
+    local resp
+    resp=$(curl -s \
         "${headers[@]}" \
         --connect-timeout "$CONNECT_TIMEOUT" \
         --max-time "$API_TIMEOUT" \
@@ -1903,26 +1914,26 @@ show_typing() {
 
 # Project context
 get_project_context() {
-    local context="Project: $WORK_DIR
-"
-    local file_count=0
-    cd "$WORK_DIR" || return
-    shopt -s nullglob
-    for file in *; do
-        if [ -f "$file" ] && [[ ! "$file" =~ ^cody ]] && [ ${#file} -lt 50 ]; then
-            local lines=$(wc -l < "$file" 2>/dev/null || echo "0")
-            if [ "$lines" -lt 200 ]; then
-                context="$context- $file ($lines lines)
-"
-                ((file_count++))
+    # Run in a subshell to avoid mutating the caller's working directory
+    (
+        cd "$WORK_DIR" || exit 0
+        local context="Project: $WORK_DIR\n"
+        local file_count=0
+        shopt -s nullglob
+        for file in *; do
+            if [ -f "$file" ] && [[ ! "$file" =~ ^cody ]] && [ ${#file} -lt 50 ]; then
+                local lines
+                lines=$(wc -l < "$file" 2>/dev/null || echo "0")
+                if [ "$lines" -lt 200 ]; then
+                    context="$context- $file ($lines lines)\n"
+                    ((file_count++))
+                fi
             fi
-        fi
-    done
-    shopt -u nullglob
-    context="$context
-Files: $file_count
-"
-    echo -e "$context"
+        done
+        shopt -u nullglob
+        context="${context}\nFiles: $file_count\n"
+        echo -e "$context"
+    )
 }
 
 # AI API call with system prompt
@@ -1940,15 +1951,23 @@ User: $prompt"
     local escaped_system=$(echo "$custom_system_prompt" | jq -Rs .)
     
     local messages="[{\"role\": \"system\", \"content\": $escaped_system}, {\"role\": \"user\", \"content\": $escaped_prompt}]"
-    
+
     local headers=()
     if ! build_request_headers headers; then
         return 1
     fi
 
-    local provider_payload=""
+    # Build JSON payload with jq so model/provider names with special chars are safe
+    local payload
+    payload=$(jq -n \
+        --arg model "$MODEL_NAME" \
+        --argjson messages "$messages" \
+        --argjson temp "$temperature" \
+        '{model: $model, messages: $messages, temperature: $temp, max_tokens: 4000}')
+
     if [ "$API_PROVIDER" = "openrouter" ] && [ -n "$PROVIDER_NAME" ]; then
-        provider_payload=", \"provider\": {\"order\": [\"$PROVIDER_NAME\"], \"allow_fallbacks\": true}"
+        payload=$(echo "$payload" | jq --arg provider "$PROVIDER_NAME" \
+            '. + {provider: {order: [$provider], allow_fallbacks: true}}')
     fi
 
     local response
@@ -1956,12 +1975,7 @@ User: $prompt"
         "${headers[@]}" \
         --connect-timeout "$CONNECT_TIMEOUT" \
         --max-time "$API_TIMEOUT" \
-        -d "{
-            \"model\": \"$MODEL_NAME\",
-            \"messages\": $messages,
-            \"temperature\": $temperature,
-            \"max_tokens\": 4000${provider_payload}
-        }" 2>/dev/null)
+        -d "$payload" 2>/dev/null)
 
     if [ -n "$response" ]; then
         local http_code=$(echo "$response" | tail -n 1)
@@ -2392,27 +2406,38 @@ handle_run() {
     # Remove any trailing whitespace from filename
     filename=$(echo "$filename" | sed 's/[[:space:]]*$//')
     local target="$filename"
-    
+
+    # Try WORK_DIR as a fallback if the file isn't found in CWD
+    if [ ! -f "$target" ] && [ -f "$WORK_DIR/$filename" ]; then
+        target="$WORK_DIR/$filename"
+    fi
+
     if [ ! -f "$target" ]; then
         echo -e "${RED}✗ File not found: $filename${NC}"
         return 1
     fi
-    
-    echo -e "${BLUE}${ROCKET_ICON} Running $filename...${NC}"
+
+    echo -e "${BLUE}${ROCKET_ICON} Running $target...${NC}"
     echo -e "${GRAY}────────────────────────────────────────${NC}"
-    
-    # Already in current directory, no need to change
-    case "$filename" in
-        *.py) python3 "$filename" || python "$filename" ;;
-        *.js) node "$filename" ;;
-        *.sh) bash "$filename" ;;
-        *.rb) ruby "$filename" ;;
-        *.go) go run "$filename" ;;
-        *) echo -e "${YELLOW}Unknown file type: $filename${NC}" ;;
+
+    local exit_code=0
+    case "$target" in
+        *.py) python3 "$target" || python "$target"; exit_code=$? ;;
+        *.js) node "$target"; exit_code=$? ;;
+        *.ts) npx --yes ts-node "$target" 2>/dev/null || node --experimental-strip-types "$target" 2>/dev/null || { echo -e "${YELLOW}ts-node not found; install with: npm i -g ts-node typescript${NC}"; exit_code=1; } ;;
+        *.sh) bash "$target"; exit_code=$? ;;
+        *.rb) ruby "$target"; exit_code=$? ;;
+        *.go) go run "$target"; exit_code=$? ;;
+        *) echo -e "${YELLOW}Unknown file type: $target${NC}"; exit_code=1 ;;
     esac
-    
+
     echo -e "${GRAY}────────────────────────────────────────${NC}"
-    echo -e "${GREEN}✓ Finished${NC}"
+    if [ "$exit_code" -eq 0 ]; then
+        echo -e "${GREEN}✓ Finished${NC}"
+    else
+        echo -e "${RED}✗ Finished with exit code: $exit_code${NC}"
+    fi
+    return "$exit_code"
 }
 
 handle_explain() {
