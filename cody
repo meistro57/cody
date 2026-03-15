@@ -1776,6 +1776,7 @@ print_header() {
         echo -e "${CYAN}Profile:${NC} ${PROFILE_NAME}"
     fi
     echo -e "${CYAN}Directory:${NC} ${WORK_DIR}"
+    echo -e "${CYAN}Streaming:${NC} ${STREAM_OUTPUT} (set STREAM_OUTPUT=1 to enable)"
     
     # System prompt with proper word wrapping
     echo -e "${CYAN}System Prompt:${NC}"
